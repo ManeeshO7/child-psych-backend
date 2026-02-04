@@ -1,0 +1,43 @@
+# virtual env
+.venv
+venv
+env
+
+# env files (secrets - do not commit)
+.env
+.env*.local
+.env.development
+.env.production
+
+# python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info
+dist
+build
+eggs
+.eggs
+
+# prisma generated (regenerate with prisma generate)
+# Keep schema and seed; ignore generated client if committed elsewhere
+# prisma/*.py in generated client folder if any
+
+# misc
+.DS_Store
+*.pem
+*.log
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Google Cloud service account keys (HIPAA-sensitive - never commit)
+*-service-account*.json
+gmtelepsych-gcp-service-account-key.json
+child-psych-services-serviceaccountkey.json

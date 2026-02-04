@@ -1,0 +1,19 @@
+# FastAPI
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# Database
+prisma==0.11.0
+
+# Auth
+argon2-cffi>=23.1.0
+
+# Email
+resend==2.5.1
+
+# Env
+python-dotenv==1.0.1
+
+# Google Cloud Healthcare API (FHIR)
+google-api-python-client==2.149.0
+google-auth==2.35.0

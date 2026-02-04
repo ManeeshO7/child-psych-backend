@@ -1,0 +1,11 @@
+{
+  "name": "mcare-backend",
+  "private": true,
+  "scripts": {
+    "studio": "dotenv -e .env -- prisma studio --schema prisma/schema.prisma"
+  },
+  "devDependencies": {
+    "dotenv-cli": "^7.4.2",
+    "prisma": "^6.0.0"
+  }
+}

@@ -1,0 +1,98 @@
+generator client {
+  provider             = "prisma-client-py"
+  interface            = "asyncio"
+  recursive_type_depth = 5
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  passwordHash   String?   @map("password_hash")
+  firstName      String    @map("first_name")
+  lastName       String    @map("last_name")
+  phone          String?
+  role           String    @default("patient") // "patient" | "doctor"
+  emailVerified  DateTime? @map("email_verified")
+  tempPasswordExpiresAt DateTime? @map("temp_password_expires_at")
+  mustResetPassword Boolean @default(false) @map("must_reset_password")
+  passwordResetToken String? @map("password_reset_token")
+  passwordResetTokenExpiresAt DateTime? @map("password_reset_token_expires_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  patientRequest   PatientRequest?
+  intakeSubmission IntakeSubmission?
+  appointmentsAsPatient Appointment[] @relation("PatientAppointments")
+  appointmentsAsDoctor   Appointment[] @relation("DoctorAppointments")
+  availabilityBlocks    DoctorAvailability[]
+  googleRefreshToken    String?   @map("google_refresh_token")
+  googleCalendarId     String?   @map("google_calendar_id")
+  @@map("users")
+}
+
+model PatientRequest {
+  id          String   @id @default(cuid())
+  firstName   String   @map("first_name")
+  lastName    String   @map("last_name")
+  email       String
+  phone       String
+  notes       String?  @db.Text
+  status      String   @default("pending") // "pending" | "approved" | "rejected"
+  rejectedNote String? @map("rejected_note") @db.Text
+  reviewedAt  DateTime? @map("reviewed_at")
+  reviewedBy  String?  @map("reviewed_by")
+  consentAt  DateTime? @map("consent_at")
+  questionnaireData Json? @map("questionnaire_data")
+  fhirQuestionnaireResponseId String? @map("fhir_questionnaire_response_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  userId String? @unique @map("user_id")
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  @@map("patient_requests")
+}
+
+model IntakeSubmission {
+  id          String   @id @default(cuid())
+  userId      String   @unique @map("user_id")
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  formData    Json     @map("form_data")
+  status      String   @default("draft") // "draft" | "submitted" | "reviewed"
+  reviewedAt  DateTime? @map("reviewed_at")
+  reviewedBy  String?  @map("reviewed_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  @@map("intake_submissions")
+}
+
+model DoctorAvailability {
+  id        String   @id @default(cuid())
+  doctorId  String   @map("doctor_id")
+  doctor    User     @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  date      DateTime @db.Date
+  startTime String   @map("start_time") // "09:00" (HH:MM, practice timezone)
+  endTime   String   @map("end_time")   // "12:00"
+  createdAt DateTime @default(now()) @map("created_at")
+  @@map("doctor_availability")
+}
+
+model Appointment {
+  id              String   @id @default(cuid())
+  patientId       String   @map("patient_id")
+  patient         User     @relation("PatientAppointments", fields: [patientId], references: [id], onDelete: Cascade)
+  doctorId        String   @map("doctor_id")
+  doctor          User     @relation("DoctorAppointments", fields: [doctorId], references: [id], onDelete: Cascade)
+  scheduledAt     DateTime @map("scheduled_at")
+  durationMinutes Int     @default(60) @map("duration_minutes")
+  status         String   @default("scheduled") // "scheduled" | "completed" | "cancelled"
+  type           String   @default("followup") // "intake" | "followup" | "post_intake"
+  notes          String?  @db.Text
+  meetLink       String?  @map("meet_link")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  @@map("appointments")
+}
