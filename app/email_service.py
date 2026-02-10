@@ -108,6 +108,7 @@ def _send_email(to: str, subject: str, html: str) -> tuple[bool, Optional[str]]:
             "to": [to],
             "subject": subject,
             "html": html,
+            "click_tracking": False,  # Disable click tracking to avoid Spectrum/ISP security blocks
         })
         # Resend returns dict with "id" on success; SDK may also return object with .id
         email_id = r.get("id") if isinstance(r, dict) else getattr(r, "id", None)
@@ -231,6 +232,69 @@ def send_approval_email(
         body_html=body,
     )
     return _send_email(to, "TelePsych — Your access has been approved", html)
+
+
+def send_appointment_confirmation_email(
+    *,
+    to: str,
+    patient_first_name: str,
+    scheduled_at_iso: str,
+    meet_link: str | None,
+) -> tuple[bool, Optional[str]]:
+    """Send appointment confirmation with date/time and Meet link (when patient books)."""
+    # Format date/time for display in Pacific Time
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        
+        PRACTICE_TZ = ZoneInfo("America/Los_Angeles")
+        dt_utc = datetime.fromisoformat(scheduled_at_iso.replace("Z", "+00:00"))
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=ZoneInfo("UTC"))
+        dt_pacific = dt_utc.astimezone(PRACTICE_TZ)
+        
+        # Get timezone abbreviation (PST or PDT)
+        tz_abbr = dt_pacific.strftime("%Z")
+        if not tz_abbr or tz_abbr == dt_pacific.strftime("%z"):
+            # Fallback if %Z doesn't work
+            tz_abbr = "PT"
+        
+        # Show in a readable form (e.g. "Jan 30, 2025 at 10:00 AM PST")
+        date_str = dt_pacific.strftime("%b %d, %Y at %I:%M %p") + f" {tz_abbr}"
+    except Exception:
+        date_str = scheduled_at_iso
+    meet_section = ""
+    if meet_link:
+        meet_section = f"""
+<div style="margin-top:14px;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+  <div style="font-weight:700;margin-bottom:6px;">Join your video visit</div>
+  <p style="margin:0 0 10px 0;">Use this link at your appointment time:</p>
+  {_button(meet_link, "Join video call")}
+  <div style="margin-top:8px;word-break:break-all;"><a href="{meet_link}" style="color:#7A5C3B;">{meet_link}</a></div>
+</div>
+"""
+    else:
+        meet_section = """
+<div style="margin-top:14px;padding:12px 14px;border:1px solid #F3D8A4;border-radius:12px;background:#FFF7E6;">
+  <div style="font-weight:700;margin-bottom:6px;">Video link</div>
+  <p style="margin:0;">Your provider will send the video visit link separately, or you can find it in your patient portal.</p>
+</div>
+"""
+    body = f"""
+<p>Hello {patient_first_name},</p>
+<p>Your appointment has been confirmed.</p>
+<div style="margin:14px 0;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+  <div style="font-weight:700;margin-bottom:6px;">Date & time</div>
+  <div>{date_str}</div>
+</div>
+{meet_section}
+<p style="margin-top:16px;">Best regards,<br/>TelePsych</p>
+"""
+    html = _wrap_email_html(
+        heading="Appointment confirmed",
+        body_html=body,
+    )
+    return _send_email(to, "TelePsych — Appointment confirmed", html)
 
 
 def send_password_reset_email(

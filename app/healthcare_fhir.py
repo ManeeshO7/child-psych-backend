@@ -145,6 +145,7 @@ def get_questionnaire_response_as_form_data(resource_id: str) -> dict[str, Any] 
     if not config or not resource_id:
         return None
     try:
+        from googleapiclient.errors import HttpError as GoogleHttpError
         from googleapiclient import discovery
 
         client = discovery.build("healthcare", "v1")
@@ -164,6 +165,11 @@ def get_questionnaire_response_as_form_data(resource_id: str) -> dict[str, Any] 
         response = request.execute()
         items = response.get("item") or []
         return _form_data_from_fhir_items(items)
+    except GoogleHttpError as e:
+        if e.resp and e.resp.status == 404:
+            logger.info("FHIR QuestionnaireResponse %s not found (deleted or never created)", resource_id)
+        else:
+            logger.warning("FHIR read failed for %s: %s", resource_id, e)
     except Exception as e:
         logger.warning("FHIR read failed for %s: %s", resource_id, e)
     return None

@@ -14,6 +14,11 @@ resend==2.5.1
 # Env
 python-dotenv==1.0.1
 
-# Google Cloud Healthcare API (FHIR)
+# Payments (card on file, charge after visit)
+stripe>=11.0.0
+
+# Google Cloud Healthcare API (FHIR) + Calendar API
 google-api-python-client==2.149.0
 google-auth==2.35.0
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0

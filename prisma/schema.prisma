@@ -32,6 +32,7 @@ model User {
   availabilityBlocks    DoctorAvailability[]
   googleRefreshToken    String?   @map("google_refresh_token")
   googleCalendarId     String?   @map("google_calendar_id")
+  stripeCustomerId     String?   @unique @map("stripe_customer_id")
   @@map("users")
 }
 
@@ -88,7 +89,7 @@ model Appointment {
   doctor          User     @relation("DoctorAppointments", fields: [doctorId], references: [id], onDelete: Cascade)
   scheduledAt     DateTime @map("scheduled_at")
   durationMinutes Int     @default(60) @map("duration_minutes")
-  status         String   @default("scheduled") // "scheduled" | "completed" | "cancelled"
+  status         String   @default("scheduled") // "scheduled" | "card_on_file" | "paid" | "completed" | "cancelled"
   type           String   @default("followup") // "intake" | "followup" | "post_intake"
   notes          String?  @db.Text
   meetLink       String?  @map("meet_link")
