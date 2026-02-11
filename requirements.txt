@@ -1,6 +1,7 @@
 # FastAPI
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
+python-multipart>=0.0.22  # Required for file uploads (UploadFile)
 
 # Database
 prisma==0.11.0
@@ -22,3 +23,6 @@ google-api-python-client==2.149.0
 google-auth==2.35.0
 google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
+
+# Google Cloud Storage (for PDF form uploads)
+google-cloud-storage>=2.10.0

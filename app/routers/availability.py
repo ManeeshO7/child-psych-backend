@@ -1,12 +1,13 @@
 """
-Doctor availability (Option A): blocks stored in DB for next 7 days.
-Slots are computed as 30-min intervals from blocks; booked slots are excluded.
+Doctor availability: blocks define "when I'm available"; doctor then picks which
+slots to offer per duration (30/45/60 min). Patients only see offered (bookable) slots.
 """
 from datetime import date, datetime, timedelta, time, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from prisma import fields as prisma_fields
 
 from app.db import get_db
 from app.dependencies import require_doctor
@@ -20,10 +21,20 @@ AVAILABILITY_DAYS_AHEAD = 60
 router = APIRouter(prefix="/api/availability", tags=["availability"])
 
 
+ALLOWED_DURATION_OPTIONS = (30, 45, 60)
+
+
 class AvailabilityBlockIn(BaseModel):
     date: str  # "YYYY-MM-DD"
     startTime: str  # "09:00"
     endTime: str  # "12:00"
+    allowedDurationsMinutes: list[int] | None = None  # e.g. [30, 45, 60]; null = all
+
+
+class OfferedSlotsIn(BaseModel):
+    date: str  # "YYYY-MM-DD"
+    durationMinutes: int  # 30, 45, or 60
+    startTimes: list[str]  # ["09:00", "09:30", ...] (HH:MM, 15-min aligned)
 
 
 def _parse_time(s: str) -> time:
@@ -131,6 +142,74 @@ async def get_available_slot_set(db, doctor_id: str) -> set[tuple[date, time]]:
     return {(d, t) for (d, t) in candidate_slots if (d, t) not in booked_starts and datetime.combine(d, t, tzinfo=PRACTICE_TZ) >= now}
 
 
+def _time_to_hhmm(t: time) -> str:
+    return t.strftime("%H:%M")
+
+
+async def _candidate_slots_for_date_duration(db, doctor_id: str, day: date, duration_minutes: int):
+    """Yield (start_dt, end_dt) for each possible slot on `day` with `duration_minutes` from blocks, excluding booked."""
+    step_minutes = 15
+    blocks = await db.doctoravailability.find_many(
+        where={
+            "doctorId": doctor_id,
+            "date": {"gte": f"{day.isoformat()}T00:00:00.000Z", "lte": f"{day.isoformat()}T23:59:59.999Z"},
+        },
+        order=[{"startTime": "asc"}],
+    )
+    appointments = await db.appointment.find_many(
+        where={
+            "doctorId": doctor_id,
+            "status": {"not": "cancelled"},
+            "scheduledAt": {
+                "gte": datetime.combine(day, time(0, 0), tzinfo=PRACTICE_TZ),
+                "lte": datetime.combine(day, time(23, 59), tzinfo=PRACTICE_TZ),
+            },
+        },
+    )
+    existing_intervals: list[tuple[datetime, datetime]] = []
+    for a in appointments:
+        s = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at")
+        if not s:
+            continue
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=timezone.utc).astimezone(PRACTICE_TZ)
+        else:
+            s = s.astimezone(PRACTICE_TZ)
+        dur = getattr(a, "durationMinutes", None) or getattr(a, "duration_minutes", SLOT_MINUTES)
+        existing_intervals.append((s, s + timedelta(minutes=dur)))
+
+    def overlaps_any(start: datetime, end: datetime) -> bool:
+        for a_start, a_end in existing_intervals:
+            if start < a_end and a_start < end:
+                return True
+        return False
+
+    now = datetime.now(PRACTICE_TZ)
+    out: list[tuple[datetime, datetime]] = []
+    for b in blocks:
+        allowed = getattr(b, "allowedDurationsMinutes", None)
+        if allowed is not None:
+            if not isinstance(allowed, list):
+                allowed = list(allowed) if allowed else []
+            if allowed and duration_minutes not in allowed:
+                continue
+        block_date = getattr(b, "date", None)
+        if block_date is None:
+            continue
+        block_date = block_date.date() if isinstance(block_date, datetime) else _parse_date(str(block_date)[:10])
+        start_t = _parse_time(b.startTime)
+        end_t = _parse_time(b.endTime)
+        block_start_dt = datetime.combine(block_date, start_t, tzinfo=PRACTICE_TZ)
+        block_end_dt = datetime.combine(block_date, end_t, tzinfo=PRACTICE_TZ)
+        t = block_start_dt
+        while t + timedelta(minutes=duration_minutes) <= block_end_dt:
+            end_dt = t + timedelta(minutes=duration_minutes)
+            if t >= now and not overlaps_any(t, end_dt):
+                out.append((t, end_dt))
+            t += timedelta(minutes=step_minutes)
+    return out
+
+
 @router.get("/")
 async def list_availability(session: dict = Depends(require_doctor)):
     """List current doctor availability blocks for the configured window (e.g. next 60 days)."""
@@ -150,11 +229,15 @@ async def list_availability(session: dict = Depends(require_doctor)):
             d_str = d.isoformat()[:10]  # Return date-only so frontend and PUT body stay consistent
         else:
             d_str = str(d)[:10]
+        allowed = getattr(b, "allowedDurationsMinutes", None)
+        if allowed is not None and not isinstance(allowed, list):
+            allowed = list(allowed) if allowed else None
         out.append({
             "id": b.id,
             "date": d_str,
             "startTime": b.startTime,
             "endTime": b.endTime,
+            "allowedDurationsMinutes": allowed,
         })
     return {"blocks": out}
 
@@ -181,6 +264,13 @@ async def set_availability(
                 status_code=400,
                 detail=f"startTime must be before endTime for {b.date}",
             )
+        if b.allowedDurationsMinutes is not None:
+            for dur in b.allowedDurationsMinutes:
+                if dur not in ALLOWED_DURATION_OPTIONS:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"allowedDurationsMinutes must only contain {ALLOWED_DURATION_OPTIONS}",
+                    )
     # Delete existing blocks in range, then create new ones (Prisma expects full ISO-8601 DateTime)
     await db.doctoravailability.delete_many(
         where={
@@ -192,56 +282,144 @@ async def set_availability(
         d = _parse_date(b.date)
         if not (start_d <= d <= end_d):
             continue
-        await db.doctoravailability.create(
-            data={
-                "doctorId": session["id"],
-                "date": f"{d.isoformat()}T00:00:00.000Z",
-                "startTime": b.startTime.strip(),
-                "endTime": b.endTime.strip(),
-            },
-        )
+        create_data: dict = {
+            "doctorId": session["id"],
+            "date": f"{d.isoformat()}T00:00:00.000Z",
+            "startTime": b.startTime.strip(),
+            "endTime": b.endTime.strip(),
+        }
+        if b.allowedDurationsMinutes is not None:
+            create_data["allowedDurationsMinutes"] = prisma_fields.Json(data=b.allowedDurationsMinutes)
+        await db.doctoravailability.create(data=create_data)
     return await list_availability(session)
 
 
-@router.get("/slots")
-async def get_available_slots():
+@router.get("/candidate-slots")
+async def get_candidate_slots(
+    date: str,  # query param: date=YYYY-MM-DD
+    durationMinutes: int,
+    session: dict = Depends(require_doctor),
+):
     """
-    Return 30-min bookable slots for the configured availability window
-    (e.g. next 60 days). No auth required so patients can see slots.
+    For the doctor: return possible slot start times on the given date for the given duration,
+    derived from availability blocks (excluding already-booked). Doctor uses these to choose which to offer.
+    """
+    if durationMinutes not in ALLOWED_DURATION_OPTIONS:
+        raise HTTPException(status_code=400, detail="durationMinutes must be 30, 45, or 60")
+    day = _parse_date(date)
+    start_d, end_d = _get_availability_window()
+    if not (start_d <= day <= end_d):
+        raise HTTPException(status_code=400, detail=f"Date must be between {start_d} and {end_d}")
+    db = await get_db()
+    pairs = await _candidate_slots_for_date_duration(db, session["id"], day, durationMinutes)
+    slots = [
+        {"startTime": _time_to_hhmm(s.time()), "endTime": _time_to_hhmm(e.time())}
+        for s, e in pairs
+    ]
+    return {"slots": slots}
+
+
+@router.get("/offered-slots")
+async def get_offered_slots(
+    date: str,  # query param: date=YYYY-MM-DD
+    durationMinutes: int,
+    session: dict = Depends(require_doctor),
+):
+    """Return the start times the doctor has already offered for this date and duration."""
+    if durationMinutes not in ALLOWED_DURATION_OPTIONS:
+        raise HTTPException(status_code=400, detail="durationMinutes must be 30, 45, or 60")
+    day = _parse_date(date)
+    start_d, end_d = _get_availability_window()
+    if not (start_d <= day <= end_d):
+        raise HTTPException(status_code=400, detail=f"Date must be between {start_d} and {end_d}")
+    db = await get_db()
+    rows = await db.doctorbookableslot.find_many(
+        where={
+            "doctorId": session["id"],
+            "date": {"gte": f"{day.isoformat()}T00:00:00.000Z", "lte": f"{day.isoformat()}T23:59:59.999Z"},
+            "durationMinutes": durationMinutes,
+        },
+        order=[{"startTime": "asc"}],
+    )
+    start_times = [getattr(r, "startTime", None) or getattr(r, "start_time") for r in rows if getattr(r, "startTime", None) or getattr(r, "start_time")]
+    return {"startTimes": start_times}
+
+
+@router.put("/offered-slots")
+async def set_offered_slots(body: OfferedSlotsIn, session: dict = Depends(require_doctor)):
+    """
+    Set which slots are offered for the given date and duration. Replaces any existing offered slots
+    for that (doctor, date, duration). startTimes must be 15-min aligned.
+    """
+    if body.durationMinutes not in ALLOWED_DURATION_OPTIONS:
+        raise HTTPException(status_code=400, detail="durationMinutes must be 30, 45, or 60")
+    day = _parse_date(body.date)
+    start_d, end_d = _get_availability_window()
+    if not (start_d <= day <= end_d):
+        raise HTTPException(status_code=400, detail=f"Date must be between {start_d} and {end_d}")
+    for st in body.startTimes:
+        _parse_time(st)  # validate
+        slot_min = int(st.split(":")[0]) * 60 + int(st.split(":")[1])
+        if slot_min % 15 != 0:
+            raise HTTPException(status_code=400, detail=f"startTime {st} must be 15-minute aligned")
+    db = await get_db()
+    await db.doctorbookableslot.delete_many(
+        where={
+            "doctorId": session["id"],
+            "date": {"gte": f"{day.isoformat()}T00:00:00.000Z", "lte": f"{day.isoformat()}T23:59:59.999Z"},
+            "durationMinutes": body.durationMinutes,
+        },
+    )
+    for st in body.startTimes:
+        await db.doctorbookableslot.create(
+            data={
+                "doctor": {"connect": {"id": session["id"]}},
+                "date": f"{day.isoformat()}T00:00:00.000Z",
+                "startTime": st.strip(),
+                "durationMinutes": body.durationMinutes,
+            },
+        )
+    rows = await db.doctorbookableslot.find_many(
+        where={
+            "doctorId": session["id"],
+            "date": {"gte": f"{day.isoformat()}T00:00:00.000Z", "lte": f"{day.isoformat()}T23:59:59.999Z"},
+            "durationMinutes": body.durationMinutes,
+        },
+        order=[{"startTime": "asc"}],
+    )
+    start_times = [getattr(r, "startTime", None) or getattr(r, "start_time") for r in rows if getattr(r, "startTime", None) or getattr(r, "start_time")]
+    return {"startTimes": start_times}
+
+
+@router.get("/slots")
+async def get_available_slots(durationMinutes: int | None = None):
+    """
+    Return bookable slots for patients. Only slots the doctor has explicitly offered
+    for this duration are returned; booked slots are excluded.
+
+    - durationMinutes: 30, 45, or 60. Defaults to SLOT_MINUTES when not provided.
     """
     db = await get_db()
     doctor = await db.user.find_first(where={"role": "doctor"})
     if not doctor:
         return {"slots": []}
+
+    requested_duration = durationMinutes or SLOT_MINUTES
+    if requested_duration <= 0:
+        raise HTTPException(status_code=400, detail="durationMinutes must be positive")
+
     start_d, end_d = _get_availability_window()
-    blocks = await db.doctoravailability.find_many(
+    bookable = await db.doctorbookableslot.find_many(
         where={
             "doctorId": doctor.id,
             "date": _date_range_iso(start_d, end_d),
+            "durationMinutes": requested_duration,
         },
         order=[{"date": "asc"}, {"startTime": "asc"}],
     )
-    # Build all candidate slots from blocks
-    candidate_slots = []
-    for b in blocks:
-        d = getattr(b, "date", None)
-        if d is None:
-            continue
-        # Normalize to date so slot keys are consistent (date, time)
-        block_date = d.date() if isinstance(d, datetime) else (d if hasattr(d, "year") else _parse_date(str(d)[:10]))
-        if not isinstance(block_date, date):
-            block_date = _parse_date(str(block_date)[:10])
-        start_t = _parse_time(b.startTime)
-        end_t = _parse_time(b.endTime)
-        for slot_date, slot_start in _block_to_slot_starts(block_date, start_t, end_t):
-            dt = _slot_to_datetime(slot_date, slot_start)
-            candidate_slots.append(dt)
-    if not candidate_slots:
+    if not bookable:
         return {"slots": []}
-    # Exclude past slots (in practice TZ)
-    now = datetime.now(PRACTICE_TZ)
-    candidate_slots = [dt for dt in candidate_slots if dt >= now]
-    # Load existing appointments for this doctor in the window
+
     window_start = datetime.combine(start_d, time(0, 0), tzinfo=PRACTICE_TZ)
     window_end = datetime.combine(end_d, time(23, 59), tzinfo=PRACTICE_TZ)
     appointments = await db.appointment.find_many(
@@ -251,27 +429,35 @@ async def get_available_slots():
             "scheduledAt": {"gte": window_start, "lte": window_end},
         },
     )
-    booked_starts = set()
+    existing_intervals: list[tuple[datetime, datetime]] = []
     for a in appointments:
         s = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at")
-        if s:
-            if s.tzinfo is None:
-                # DB stores UTC; treat naive as UTC then convert to practice TZ
-                s = s.replace(tzinfo=timezone.utc).astimezone(PRACTICE_TZ)
-            else:
-                s = s.astimezone(PRACTICE_TZ)
-            # Normalize to (date, time(hour, minute)) so slot comparison matches 30-min slots
-            booked_starts.add((s.date(), time(s.hour, s.minute)))
-    # Filter out slots that overlap a booked appointment (same 30-min slot)
-    def slot_key(dt: datetime):
-        return (dt.date(), dt.time())
-    available = [
-        dt for dt in candidate_slots
-        if slot_key(dt) not in booked_starts
-    ]
-    return {
-        "slots": [
-            {"start": dt.isoformat(), "end": (dt + timedelta(minutes=SLOT_MINUTES)).isoformat()}
-            for dt in sorted(available)
-        ],
-    }
+        if not s:
+            continue
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=timezone.utc).astimezone(PRACTICE_TZ)
+        else:
+            s = s.astimezone(PRACTICE_TZ)
+        dur = getattr(a, "durationMinutes", None) or getattr(a, "duration_minutes", SLOT_MINUTES)
+        existing_intervals.append((s, s + timedelta(minutes=dur)))
+
+    def overlaps_any(start: datetime, end: datetime) -> bool:
+        for a_start, a_end in existing_intervals:
+            if start < a_end and a_start < end:
+                return True
+        return False
+
+    now = datetime.now(PRACTICE_TZ)
+    result_slots: list[dict] = []
+    for row in bookable:
+        d = getattr(row, "date", None)
+        if d is None:
+            continue
+        block_date = d.date() if isinstance(d, datetime) else _parse_date(str(d)[:10])
+        start_t = _parse_time(getattr(row, "startTime", None) or getattr(row, "start_time", ""))
+        start_dt = datetime.combine(block_date, start_t, tzinfo=PRACTICE_TZ)
+        end_dt = start_dt + timedelta(minutes=requested_duration)
+        if start_dt >= now and not overlaps_any(start_dt, end_dt):
+            result_slots.append({"start": start_dt.isoformat(), "end": end_dt.isoformat()})
+
+    return {"slots": result_slots}

@@ -30,9 +30,11 @@ model User {
   appointmentsAsPatient Appointment[] @relation("PatientAppointments")
   appointmentsAsDoctor   Appointment[] @relation("DoctorAppointments")
   availabilityBlocks    DoctorAvailability[]
+  bookableSlots         DoctorBookableSlot[]
   googleRefreshToken    String?   @map("google_refresh_token")
   googleCalendarId     String?   @map("google_calendar_id")
   stripeCustomerId     String?   @unique @map("stripe_customer_id")
+  formAssignments PatientFormAssignment[] @relation("PatientFormAssignments")
   @@map("users")
 }
 
@@ -71,14 +73,28 @@ model IntakeSubmission {
 }
 
 model DoctorAvailability {
-  id        String   @id @default(cuid())
-  doctorId  String   @map("doctor_id")
-  doctor    User     @relation(fields: [doctorId], references: [id], onDelete: Cascade)
-  date      DateTime @db.Date
-  startTime String   @map("start_time") // "09:00" (HH:MM, practice timezone)
-  endTime   String   @map("end_time")   // "12:00"
-  createdAt DateTime @default(now()) @map("created_at")
+  id                     String    @id @default(cuid())
+  doctorId               String    @map("doctor_id")
+  doctor                 User      @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  date                   DateTime  @db.Date
+  startTime              String    @map("start_time") // "09:00" (HH:MM, practice timezone)
+  endTime                String    @map("end_time")   // "12:00"
+  allowedDurationsMinutes Json?    @map("allowed_durations_minutes") // e.g. [30, 45, 60]; null = all
+  createdAt              DateTime  @default(now()) @map("created_at")
   @@map("doctor_availability")
+}
+
+// Slots the doctor has explicitly offered for booking (per duration). Patients only see these.
+model DoctorBookableSlot {
+  id               String   @id @default(cuid())
+  doctorId         String   @map("doctor_id")
+  doctor           User     @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  date             DateTime @db.Date
+  startTime        String   @map("start_time") // "09:00" (HH:MM, practice TZ)
+  durationMinutes  Int      @map("duration_minutes") // 30, 45, or 60
+  createdAt        DateTime @default(now()) @map("created_at")
+  @@unique([doctorId, date, startTime, durationMinutes])
+  @@map("doctor_bookable_slots")
 }
 
 model Appointment {
@@ -90,10 +106,62 @@ model Appointment {
   scheduledAt     DateTime @map("scheduled_at")
   durationMinutes Int     @default(60) @map("duration_minutes")
   status         String   @default("scheduled") // "scheduled" | "card_on_file" | "paid" | "completed" | "cancelled"
-  type           String   @default("followup") // "intake" | "followup" | "post_intake"
+  type           String   @default("followup") // orientation_consult | clinical_intake | followup_med_30 | followup_med_therapy_45 | intake | followup | post_intake (legacy)
   notes          String?  @db.Text
   meetLink       String?  @map("meet_link")
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
+  
+  formAssignments PatientFormAssignment[]
   @@map("appointments")
+}
+
+// Master list of all available forms (questionnaires + PDF templates)
+model Form {
+  id              String   @id @default(cuid())
+  title           String
+  description     String?  @db.Text
+  type            String   // "questionnaire" | "pdf_upload"
+  questionnaireKey String? @map("questionnaire_key") // For questionnaires: which form definition to render
+  templateGcsPath String?  @map("template_gcs_path") // For PDFs: "forms/templates/Clinical_Workflow_Blueprint.pdf"
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+  
+  assignments     PatientFormAssignment[]
+  @@map("forms")
+}
+
+// Which forms are assigned to which patient (after intake appointment)
+model PatientFormAssignment {
+  id              String   @id @default(cuid())
+  patientId       String   @map("patient_id")
+  patient         User     @relation("PatientFormAssignments", fields: [patientId], references: [id], onDelete: Cascade)
+  formId          String   @map("form_id")
+  form            Form     @relation(fields: [formId], references: [id], onDelete: Cascade)
+  appointmentId   String?  @map("appointment_id") // Intake appointment that triggered this
+  appointment     Appointment? @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
+  assignedBy      String   @map("assigned_by") // Doctor user ID
+  assignedAt      DateTime @default(now()) @map("assigned_at")
+  status          String   @default("pending") // "pending" | "completed"
+  completedAt     DateTime? @map("completed_at")
+  
+  // For questionnaires: FHIR QuestionnaireResponse ID
+  fhirResponseId String?  @map("fhir_response_id")
+  
+  // For PDF uploads: GCS path to uploaded file
+  uploadedGcsPath String?  @map("uploaded_gcs_path") // e.g. "patient-docs/patient-{id}/forms/{assignmentId}.pdf"
+  
+  submission      FormSubmission?
+  @@map("patient_form_assignments")
+}
+
+// Track submission metadata
+model FormSubmission {
+  id            String   @id @default(cuid())
+  assignmentId String   @unique @map("assignment_id")
+  assignment    PatientFormAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  submittedAt   DateTime @default(now()) @map("submitted_at")
+  notes         String?  @db.Text // Optional patient notes
+  @@map("form_submissions")
 }

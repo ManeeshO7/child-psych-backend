@@ -220,21 +220,51 @@ async def get_visit_pricing():
     """
     import stripe
 
-    pricing = {}
+    pricing: dict = {}
     for visit_type in ["intake", "post_intake", "followup"]:
         price_id = get_visit_price_id(visit_type)
         if price_id and os.environ.get("STRIPE_SECRET_KEY"):
-            # Fetch actual price from Stripe
             try:
                 price_obj = stripe.Price.retrieve(price_id)
                 amount_cents = price_obj.unit_amount or 0
             except Exception:
-                # Fallback to env if Stripe fetch fails
                 amount_cents = get_visit_price_cents(visit_type)
         else:
-            # Use env-based pricing
             amount_cents = get_visit_price_cents(visit_type)
         pricing[visit_type] = {
+            "amountCents": amount_cents,
+            "amountDollars": amount_cents / 100,
+            "formatted": f"${amount_cents / 100:.2f}",
+        }
+    # Duration-based pricing (30/45/60 min) - env VISIT_PRICE_30_CENTS, etc. or STRIPE_PRICE_ID_30
+    for duration in [30, 45, 60]:
+        key = str(duration)
+        price_id = get_visit_price_id(key)
+        if price_id and os.environ.get("STRIPE_SECRET_KEY"):
+            try:
+                price_obj = stripe.Price.retrieve(price_id)
+                amount_cents = price_obj.unit_amount or 0
+            except Exception:
+                amount_cents = get_visit_price_cents(key)
+        else:
+            amount_cents = get_visit_price_cents(key)
+        pricing[key] = {
+            "amountCents": amount_cents,
+            "amountDollars": amount_cents / 100,
+            "formatted": f"${amount_cents / 100:.2f}",
+        }
+    # Appointment-type pricing (orientation_consult, clinical_intake, followup_med_30, followup_med_therapy_45)
+    for apt_type in ["orientation_consult", "clinical_intake", "followup_med_30", "followup_med_therapy_45"]:
+        price_id = get_visit_price_id(apt_type)
+        if price_id and os.environ.get("STRIPE_SECRET_KEY"):
+            try:
+                price_obj = stripe.Price.retrieve(price_id)
+                amount_cents = price_obj.unit_amount or 0
+            except Exception:
+                amount_cents = get_visit_price_cents(apt_type)
+        else:
+            amount_cents = get_visit_price_cents(apt_type)
+        pricing[apt_type] = {
             "amountCents": amount_cents,
             "amountDollars": amount_cents / 100,
             "formatted": f"${amount_cents / 100:.2f}",

@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, time
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -7,9 +7,18 @@ import os
 
 from app.db import get_db
 from app.dependencies import require_patient, require_patient_or_doctor, require_doctor
-from app.routers.availability import get_available_slot_set, PRACTICE_TZ, SLOT_MINUTES
+from app.routers.availability import PRACTICE_TZ, SLOT_MINUTES
 
 router = APIRouter(prefix="/api/appointments", tags=["appointments"])
+
+# Appointment types and phase gating
+APPOINTMENT_TYPES = {
+    "orientation_consult": {"durationMinutes": 30, "label": "Orientation consultation"},
+    "clinical_intake": {"durationMinutes": 60, "label": "Clinical Intake Appointment"},
+    "followup_med_30": {"durationMinutes": 30, "label": "Follow-up (med management, 30 min)"},
+    "followup_med_therapy_45": {"durationMinutes": 45, "label": "Follow-up (med + therapy, 45 min)"},
+}
+VALID_APPOINTMENT_TYPES = set(APPOINTMENT_TYPES.keys())
 
 
 def _get_attr(obj, *names, default=None):
@@ -60,6 +69,93 @@ class CreateAppointmentBody(BaseModel):
 class UpdateAppointmentBody(BaseModel):
     status: str | None = None
     notes: str | None = None
+
+
+@router.get("/allowed-types")
+async def get_allowed_appointment_types(session: dict = Depends(require_patient)):
+    """
+    Return appointment types the current patient is allowed to book, based on phase:
+    - New patients: only orientation_consult (30 min).
+    - After orientation + approval + no pending forms: clinical_intake (60 min).
+    - After clinical intake: followup_med_30 and followup_med_therapy_45.
+    """
+    db = await get_db()
+    patient_id = session["id"]
+
+    completed = await db.appointment.find_many(
+        where={
+            "patientId": patient_id,
+            "status": {"in": ["completed", "paid"]},
+        },
+    )
+    completed_types = {a.type for a in completed}
+    has_orientation = "orientation_consult" in completed_types
+    has_intake = "clinical_intake" in completed_types or "intake" in completed_types
+
+    patient_user = await db.user.find_unique(
+        where={"id": patient_id},
+        include={"patientRequest": True},
+    )
+    request_status = None
+    if getattr(patient_user, "patientRequest", None):
+        request_status = getattr(patient_user.patientRequest, "status", None)
+    is_approved = request_status == "approved"
+
+    pending_forms_count = await db.patientformassignment.count(
+        where={"patientId": patient_id, "status": "pending"},
+    )
+    no_pending_forms = pending_forms_count == 0
+
+    allowed = []
+    if not has_orientation:
+        allowed.append({
+            "type": "orientation_consult",
+            "durationMinutes": APPOINTMENT_TYPES["orientation_consult"]["durationMinutes"],
+            "label": APPOINTMENT_TYPES["orientation_consult"]["label"],
+        })
+    if has_orientation and is_approved and no_pending_forms and not has_intake:
+        allowed.append({
+            "type": "clinical_intake",
+            "durationMinutes": APPOINTMENT_TYPES["clinical_intake"]["durationMinutes"],
+            "label": APPOINTMENT_TYPES["clinical_intake"]["label"],
+        })
+    if has_intake:
+        allowed.append({
+            "type": "followup_med_30",
+            "durationMinutes": APPOINTMENT_TYPES["followup_med_30"]["durationMinutes"],
+            "label": APPOINTMENT_TYPES["followup_med_30"]["label"],
+        })
+        allowed.append({
+            "type": "followup_med_therapy_45",
+            "durationMinutes": APPOINTMENT_TYPES["followup_med_therapy_45"]["durationMinutes"],
+            "label": APPOINTMENT_TYPES["followup_med_therapy_45"]["label"],
+        })
+
+    allowed_set = {a["type"] for a in allowed}
+    all_types = [
+        {"type": k, "durationMinutes": v["durationMinutes"], "label": v["label"]}
+        for k, v in APPOINTMENT_TYPES.items()
+    ]
+    not_allowed_reasons = {}
+    if "orientation_consult" not in allowed_set:
+        not_allowed_reasons["orientation_consult"] = "You've already completed orientation."
+    if "clinical_intake" not in allowed_set:
+        if not has_orientation:
+            not_allowed_reasons["clinical_intake"] = "Complete your initial evaluation (orientation) first."
+        elif has_intake:
+            not_allowed_reasons["clinical_intake"] = "You've already completed clinical intake."
+        else:
+            not_allowed_reasons["clinical_intake"] = "Complete your initial evaluation and get approved first."
+    if "followup_med_30" not in allowed_set:
+        not_allowed_reasons["followup_med_30"] = "Complete clinical intake first."
+    if "followup_med_therapy_45" not in allowed_set:
+        not_allowed_reasons["followup_med_therapy_45"] = "Complete clinical intake first."
+
+    return {
+        "allowedTypes": allowed,
+        "allTypes": all_types,
+        "notAllowedReasons": not_allowed_reasons,
+    }
 
 
 @router.get("/")
@@ -123,6 +219,7 @@ async def list_appointments_paged(
     limit: int = 50,
     cursor: str | None = None,
     view: str | None = None,  # "active" | "completed" | None
+    date_str: str | None = None,  # YYYY-MM-DD in practice (PST) timezone
 ):
     """
     Cursor-based pagination for appointments.
@@ -131,6 +228,7 @@ async def list_appointments_paged(
       { "items": [...], "nextCursor": "appt_id" | null, "hasMore": bool }
 
     Pass `cursor=<last_seen_id>` to fetch the next page.
+    Optional `date_str=YYYY-MM-DD` filters to appointments on that date (PST).
     """
     db = await get_db()
     role = session["role"]
@@ -146,6 +244,17 @@ async def list_appointments_paged(
         where = {**where, "status": "completed"}
     elif view == "active":
         where = {**where, "status": {"in": ["scheduled", "card_on_file", "paid"]}}
+
+    if date_str:
+        try:
+            day = date.fromisoformat(date_str)
+            start_practice = datetime.combine(day, time(0, 0), tzinfo=PRACTICE_TZ)
+            end_practice = datetime.combine(day, time(23, 59, 59, 999999), tzinfo=PRACTICE_TZ)
+            start_utc = start_practice.astimezone(timezone.utc)
+            end_utc = end_practice.astimezone(timezone.utc)
+            where["scheduledAt"] = {"gte": start_utc, "lte": end_utc}
+        except (ValueError, TypeError):
+            pass  # ignore invalid date_str
     include = {"doctor": True} if role == "patient" else {"patient": True}
     order = [{"scheduledAt": "desc"}, {"id": "desc"}]
 
@@ -191,23 +300,138 @@ async def create_appointment(
     if scheduled_at.tzinfo is None:
         scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
     scheduled_at_practice = scheduled_at.astimezone(PRACTICE_TZ)
-    # Require 30-min slot alignment
+    # Require 15-min slot alignment so we can support 30/45/60-minute sessions
     slot_minutes = scheduled_at_practice.hour * 60 + scheduled_at_practice.minute
-    if slot_minutes % SLOT_MINUTES != 0 or scheduled_at_practice.second != 0 or scheduled_at_practice.microsecond != 0:
+    if slot_minutes % 15 != 0 or scheduled_at_practice.second != 0 or scheduled_at_practice.microsecond != 0:
         raise HTTPException(
             status_code=400,
-            detail="scheduledAt must be a 30-minute slot start (e.g. 10:00 or 10:30)",
+            detail="scheduledAt must be a 15-minute slot start (e.g. 10:00, 10:15, 10:30)",
         )
     doctor = await db.user.find_first(where={"role": "doctor"})
     if not doctor:
         raise HTTPException(status_code=503, detail="No provider available")
-    available = await get_available_slot_set(db, doctor.id)
-    slot_key = (scheduled_at_practice.date(), scheduled_at_practice.time())
-    if slot_key not in available:
+
+    # Validate appointment type and phase gating
+    if body.type not in VALID_APPOINTMENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid type. Must be one of: {sorted(VALID_APPOINTMENT_TYPES)}",
+        )
+    expected_duration = APPOINTMENT_TYPES[body.type]["durationMinutes"]
+    requested_duration = body.durationMinutes or expected_duration
+    if requested_duration != expected_duration:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Appointment type {body.type} requires durationMinutes={expected_duration}",
+        )
+
+    # Phase gating: ensure patient is allowed to book this type
+    completed = await db.appointment.find_many(
+        where={"patientId": session["id"], "status": {"in": ["completed", "paid"]}},
+    )
+    completed_types = {a.type for a in completed}
+    has_orientation = "orientation_consult" in completed_types
+    has_intake = "clinical_intake" in completed_types or "intake" in completed_types
+    patient_user = await db.user.find_unique(where={"id": session["id"]}, include={"patientRequest": True})
+    request_status = getattr(patient_user.patientRequest, "status", None) if getattr(patient_user, "patientRequest", None) else None
+    is_approved = request_status == "approved"
+    pending_forms_count = await db.patientformassignment.count(
+        where={"patientId": session["id"], "status": "pending"},
+    )
+    no_pending_forms = pending_forms_count == 0
+
+    if body.type == "orientation_consult" and has_orientation:
+        raise HTTPException(status_code=403, detail="You have already completed orientation. You can book clinical intake or follow-ups.")
+    if body.type == "clinical_intake":
+        if not has_orientation:
+            raise HTTPException(status_code=403, detail="Complete an orientation consultation first.")
+        if not is_approved:
+            raise HTTPException(status_code=403, detail="Your access must be approved before booking clinical intake.")
+        if not no_pending_forms:
+            raise HTTPException(status_code=403, detail="Complete your assigned forms before booking clinical intake.")
+    if body.type in ("followup_med_30", "followup_med_therapy_45") and not has_intake:
+        raise HTTPException(status_code=403, detail="Complete clinical intake before booking follow-ups.")
+
+    # Validate that the requested interval fits inside an availability block
+    # and does not overlap existing appointments.
+    if requested_duration <= 0:
+        raise HTTPException(status_code=400, detail="durationMinutes must be positive")
+
+    candidate_start = scheduled_at_practice
+    candidate_end = candidate_start + timedelta(minutes=requested_duration)
+
+    # Cannot book in the past (in practice timezone)
+    now_practice = datetime.now(PRACTICE_TZ)
+    if candidate_start < now_practice:
+        raise HTTPException(status_code=400, detail="Cannot book an appointment in the past")
+
+    day = candidate_start.date()
+    day_start = datetime.combine(day, time(0, 0), tzinfo=PRACTICE_TZ)
+    day_end = datetime.combine(day, time(23, 59), tzinfo=PRACTICE_TZ)
+
+    # Slot must be one the doctor has offered for this duration (DoctorBookableSlot)
+    start_hhmm = candidate_start.strftime("%H:%M")
+    offered = await db.doctorbookableslot.find_first(
+        where={
+            "doctorId": doctor.id,
+            "date": {"gte": f"{day.isoformat()}T00:00:00.000Z", "lte": f"{day.isoformat()}T23:59:59.999Z"},
+            "startTime": start_hhmm,
+            "durationMinutes": requested_duration,
+        },
+    )
+    if not offered:
         raise HTTPException(
             status_code=409,
-            detail="This slot is no longer available. Please choose another time.",
+            detail="This time is no longer available. Please choose another time.",
         )
+
+    # Ensure no overlap with existing appointments for this doctor on that day
+    existing_appointments = await db.appointment.find_many(
+        where={
+            "doctorId": doctor.id,
+            "status": {"not": "cancelled"},
+            "scheduledAt": {"gte": day_start, "lte": day_end},
+        },
+    )
+
+    for a in existing_appointments:
+        s = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at", None)
+        if not s:
+            continue
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=timezone.utc).astimezone(PRACTICE_TZ)
+        else:
+            s = s.astimezone(PRACTICE_TZ)
+        dur = getattr(a, "durationMinutes", None) or getattr(a, "duration_minutes", SLOT_MINUTES)
+        e = s + timedelta(minutes=dur)
+        if candidate_start < e and s < candidate_end:
+            raise HTTPException(
+                status_code=409,
+                detail="This time is no longer available. Please choose another time.",
+            )
+    
+    # Check for pending forms (if patient has completed an intake appointment)
+    completed_intake = await db.appointment.find_first(
+        where={
+            "patientId": session["id"],
+            "type": "intake",
+            "status": {"in": ["completed", "paid"]},
+        },
+    )
+    if completed_intake:
+        # Patient has completed intake, check for pending forms
+        pending_forms_count = await db.patientformassignment.count(
+            where={
+                "patientId": session["id"],
+                "status": "pending",
+            },
+        )
+        if pending_forms_count > 0:
+            raise HTTPException(
+                status_code=403,
+                detail=f"You have {pending_forms_count} pending form(s) to complete before booking your next appointment. Please complete them in the Forms & Documents section.",
+            )
+    
     # Meet link: create via Google Calendar API if doctor has connected Calendar
     patient_user = await db.user.find_unique(where={"id": session["id"]})
     patient_name = "Patient"
