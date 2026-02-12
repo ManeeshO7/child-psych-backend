@@ -135,7 +135,7 @@ async def create_setup_intent_for_appointment(
         patient_id = _get_attr(appointment, "patientId", "patient_id")
         if patient_id != session["id"]:
             raise HTTPException(status_code=403, detail="Not your appointment")
-        if appointment.status not in ("scheduled", "card_on_file"):
+        if appointment.status not in ("scheduled", "card_on_file", "pending_confirmation"):
             raise HTTPException(
                 status_code=400,
                 detail="Appointment is not in a state that allows saving a card",
@@ -198,12 +198,14 @@ async def confirm_card_on_file(
     if not stripe_id:
         raise HTTPException(status_code=400, detail="No Stripe customer for this account")
     set_default_payment_method(stripe_id, body.paymentMethodId)
-    # If we have an appointment, also mark it as card_on_file so doctors can charge.
-    if body.appointmentId:
+    # If we have an appointment and it's not pending_confirmation, mark as card_on_file.
+    # For pending_confirmation, the patient must explicitly confirm via confirm-by-patient.
+    if body.appointmentId and appointment and appointment.status != "pending_confirmation":
         await db.appointment.update(
             where={"id": body.appointmentId},
             data={"status": "card_on_file"},
         )
+    if body.appointmentId:
         return {"ok": True, "status": "card_on_file"}
     # Card saved for patient, but no specific appointment yet.
     return {"ok": True, "status": "card_on_file"}

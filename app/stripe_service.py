@@ -9,6 +9,13 @@ import stripe
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 
+# Map legacy appointment types to current types for pricing
+_TYPE_PRICE_MAP = {
+    "intake": "clinical_intake",
+    "post_intake": "followup_med_30",
+    "followup": "followup_med_30",
+}
+
 
 def get_or_create_customer(user_id: str, email: str, existing_stripe_id: Optional[str] = None) -> str:
     """Return Stripe customer ID, creating a customer if needed."""
@@ -90,10 +97,11 @@ def charge_customer(
 def get_visit_price_cents(appointment_type: str) -> int:
     """
     Get visit price in cents for an appointment type.
-    Checks env vars: VISIT_PRICE_{TYPE}_CENTS (e.g., VISIT_PRICE_POST_INTAKE_CENTS).
-    Falls back to POST_INTAKE_VISIT_AMOUNT_CENTS for post_intake, or 15000 default.
+    Checks env vars: VISIT_PRICE_{TYPE}_CENTS (e.g., VISIT_PRICE_ORIENTATION_CONSULT_CENTS).
+    Maps legacy types (intake, post_intake, followup) to current types.
     """
-    type_upper = appointment_type.upper().replace("-", "_")
+    apt_type = _TYPE_PRICE_MAP.get(appointment_type, appointment_type)
+    type_upper = apt_type.upper().replace("-", "_")
     env_key = f"VISIT_PRICE_{type_upper}_CENTS"
     amount_str = os.environ.get(env_key)
     if amount_str:
@@ -108,8 +116,10 @@ def get_visit_price_cents(appointment_type: str) -> int:
 def get_visit_price_id(appointment_type: str) -> Optional[str]:
     """
     Get Stripe Price ID for an appointment type (if using Products/Prices).
-    Checks env vars: STRIPE_PRICE_ID_{TYPE} (e.g., STRIPE_PRICE_ID_POST_INTAKE).
+    Checks env vars: STRIPE_PRICE_ID_{TYPE} (e.g., STRIPE_PRICE_ID_ORIENTATION_CONSULT).
+    Maps legacy types (intake, post_intake, followup) to current types.
     Returns None if not configured (will use amount_cents instead).
     """
-    type_upper = appointment_type.upper().replace("-", "_")
+    apt_type = _TYPE_PRICE_MAP.get(appointment_type, appointment_type)
+    type_upper = apt_type.upper().replace("-", "_")
     return os.environ.get(f"STRIPE_PRICE_ID_{type_upper}")

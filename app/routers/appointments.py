@@ -8,6 +8,7 @@ import os
 from app.db import get_db
 from app.dependencies import require_patient, require_patient_or_doctor, require_doctor
 from app.routers.availability import PRACTICE_TZ, SLOT_MINUTES
+from prisma import fields as prisma_fields
 
 router = APIRouter(prefix="/api/appointments", tags=["appointments"])
 
@@ -71,6 +72,17 @@ class UpdateAppointmentBody(BaseModel):
     notes: str | None = None
 
 
+class SetAllowedFollowupBody(BaseModel):
+    allowedTypes: list[str]  # ["followup_med_30", "followup_med_therapy_45"]
+
+
+class ScheduleForPatientBody(BaseModel):
+    patientId: str
+    scheduledAt: str  # ISO datetime
+    durationMinutes: int  # 30 or 45
+    type: str  # followup_med_30 or followup_med_therapy_45
+
+
 @router.get("/allowed-types")
 async def get_allowed_appointment_types(session: dict = Depends(require_patient)):
     """
@@ -120,16 +132,20 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
             "label": APPOINTMENT_TYPES["clinical_intake"]["label"],
         })
     if has_intake:
-        allowed.append({
-            "type": "followup_med_30",
-            "durationMinutes": APPOINTMENT_TYPES["followup_med_30"]["durationMinutes"],
-            "label": APPOINTMENT_TYPES["followup_med_30"]["label"],
-        })
-        allowed.append({
-            "type": "followup_med_therapy_45",
-            "durationMinutes": APPOINTMENT_TYPES["followup_med_therapy_45"]["durationMinutes"],
-            "label": APPOINTMENT_TYPES["followup_med_therapy_45"]["label"],
-        })
+        # Only show follow-ups the doctor assigned after clinical intake
+        allowed_followup = getattr(patient_user, "allowedFollowupTypes", None) or getattr(
+            patient_user, "allowed_followup_types", None
+        )
+        followup_types = []
+        if allowed_followup and isinstance(allowed_followup, list):
+            followup_types = [t for t in allowed_followup if t in ("followup_med_30", "followup_med_therapy_45")]
+        for apt_type in followup_types:
+            if apt_type in APPOINTMENT_TYPES:
+                allowed.append({
+                    "type": apt_type,
+                    "durationMinutes": APPOINTMENT_TYPES[apt_type]["durationMinutes"],
+                    "label": APPOINTMENT_TYPES[apt_type]["label"],
+                })
 
     allowed_set = {a["type"] for a in allowed}
     all_types = [
@@ -147,9 +163,15 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
         else:
             not_allowed_reasons["clinical_intake"] = "Complete your initial evaluation and get approved first."
     if "followup_med_30" not in allowed_set:
-        not_allowed_reasons["followup_med_30"] = "Complete clinical intake first."
+        not_allowed_reasons["followup_med_30"] = (
+            "Doctor will assign your follow-up type after clinical intake."
+            if has_intake else "Complete clinical intake first."
+        )
     if "followup_med_therapy_45" not in allowed_set:
-        not_allowed_reasons["followup_med_therapy_45"] = "Complete clinical intake first."
+        not_allowed_reasons["followup_med_therapy_45"] = (
+            "Doctor will assign your follow-up type after clinical intake."
+            if has_intake else "Complete clinical intake first."
+        )
 
     return {
         "allowedTypes": allowed,
@@ -243,7 +265,7 @@ async def list_appointments_paged(
     if view == "completed":
         where = {**where, "status": "completed"}
     elif view == "active":
-        where = {**where, "status": {"in": ["scheduled", "card_on_file", "paid"]}}
+        where = {**where, "status": {"in": ["scheduled", "card_on_file", "paid", "pending_confirmation"]}}
 
     if date_str:
         try:
@@ -349,8 +371,17 @@ async def create_appointment(
             raise HTTPException(status_code=403, detail="Your access must be approved before booking clinical intake.")
         if not no_pending_forms:
             raise HTTPException(status_code=403, detail="Complete your assigned forms before booking clinical intake.")
-    if body.type in ("followup_med_30", "followup_med_therapy_45") and not has_intake:
-        raise HTTPException(status_code=403, detail="Complete clinical intake before booking follow-ups.")
+    if body.type in ("followup_med_30", "followup_med_therapy_45"):
+        if not has_intake:
+            raise HTTPException(status_code=403, detail="Complete clinical intake before booking follow-ups.")
+        allowed_followup = getattr(patient_user, "allowedFollowupTypes", None) or getattr(
+            patient_user, "allowed_followup_types", None
+        )
+        if not allowed_followup or not isinstance(allowed_followup, list) or body.type not in allowed_followup:
+            raise HTTPException(
+                status_code=403,
+                detail="Your doctor will assign your follow-up type after clinical intake.",
+            )
 
     # Validate that the requested interval fits inside an availability block
     # and does not overlap existing appointments.
@@ -490,6 +521,81 @@ async def create_appointment(
     return _serialize_appointment(appointment)
 
 
+@router.get("/patient/{patient_id}/allowed-followup-types")
+async def get_patient_allowed_followup_types(
+    patient_id: str,
+    session: dict = Depends(require_doctor),
+):
+    """Get which follow-up types a patient can book (doctor only)."""
+    db = await get_db()
+    patient = await db.user.find_unique(where={"id": patient_id})
+    if not patient or patient.role != "patient":
+        raise HTTPException(status_code=404, detail="Patient not found")
+    raw = getattr(patient, "allowedFollowupTypes", None) or getattr(patient, "allowed_followup_types", None)
+    allowed = [t for t in (raw if isinstance(raw, list) else []) if t in ("followup_med_30", "followup_med_therapy_45")]
+    return {"allowedTypes": allowed}
+
+
+@router.put("/patient/{patient_id}/allowed-followup-types")
+async def set_patient_allowed_followup_types(
+    patient_id: str,
+    body: SetAllowedFollowupBody,
+    session: dict = Depends(require_doctor),
+):
+    """Set which follow-up types (30 or 45 min) a patient can book. Call after clinical intake."""
+    db = await get_db()
+    patient = await db.user.find_unique(where={"id": patient_id})
+    if not patient or patient.role != "patient":
+        raise HTTPException(status_code=404, detail="Patient not found")
+    valid = [t for t in body.allowedTypes if t in ("followup_med_30", "followup_med_therapy_45")]
+    await db.user.update(
+        where={"id": patient_id},
+        data={"allowedFollowupTypes": prisma_fields.Json(data=valid)},
+    )
+    return {"ok": True, "allowedTypes": valid}
+
+
+@router.post("/schedule-for-patient")
+async def schedule_for_patient(body: ScheduleForPatientBody, session: dict = Depends(require_doctor)):
+    """Doctor schedules a follow-up for a patient. Creates appointment with status pending_confirmation.
+    Patient will then add card and confirm."""
+    db = await get_db()
+    doctor = await db.user.find_first(where={"role": "doctor"})
+    if not doctor or doctor.id != session["id"]:
+        raise HTTPException(status_code=403, detail="Not a doctor")
+    patient = await db.user.find_unique(where={"id": body.patientId})
+    if not patient or patient.role != "patient":
+        raise HTTPException(status_code=404, detail="Patient not found")
+    if body.type not in ("followup_med_30", "followup_med_therapy_45"):
+        raise HTTPException(status_code=400, detail="Type must be followup_med_30 or followup_med_therapy_45")
+    raw = getattr(patient, "allowedFollowupTypes", None) or getattr(patient, "allowed_followup_types", None)
+    allowed_list = [t for t in (raw if isinstance(raw, list) else []) if t in ("followup_med_30", "followup_med_therapy_45")]
+    if body.type not in allowed_list:
+        raise HTTPException(
+            status_code=400,
+            detail="Patient is not assigned this follow-up type. Set allowed follow-up types first.",
+        )
+    try:
+        scheduled_at = datetime.fromisoformat(body.scheduledAt.replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid scheduledAt (use ISO format)")
+    if scheduled_at.tzinfo is None:
+        scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+    if body.durationMinutes not in (30, 45):
+        raise HTTPException(status_code=400, detail="durationMinutes must be 30 or 45")
+    apt = await db.appointment.create(
+        data={
+            "patientId": body.patientId,
+            "doctorId": doctor.id,
+            "scheduledAt": scheduled_at,
+            "durationMinutes": body.durationMinutes,
+            "type": body.type,
+            "status": "pending_confirmation",
+        },
+    )
+    return {"ok": True, "appointment": _serialize_appointment(apt, include_patient=True)}
+
+
 @router.get("/{id}")
 async def get_appointment(id: str, session: dict = Depends(require_patient_or_doctor)):
     db = await get_db()
@@ -582,14 +688,10 @@ async def charge_appointment(id: str, session: dict = Depends(require_doctor)):
         raise HTTPException(status_code=400, detail="Patient has no card on file")
     appointment_type = getattr(appointment, "type", None) or "post_intake"
     price_id = get_visit_price_id(appointment_type)
-    if not price_id:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Stripe Price ID not configured for appointment type '{appointment_type}'. "
-            f"Set STRIPE_PRICE_ID_{appointment_type.upper().replace('-', '_')} in the backend .env.",
-        )
-    # amount_cents is only for logging/metadata; Stripe uses price_id for the actual charge
     amount_cents = get_visit_price_cents(appointment_type)
+    if not price_id:
+        # Fallback to amount_cents when Price IDs not configured (use env VISIT_PRICE_*_CENTS)
+        price_id = None
     scheduled_at = getattr(appointment, "scheduledAt", None) or getattr(appointment, "scheduled_at")
     desc = f"TelePsych {appointment_type.replace('_', ' ')} visit — {scheduled_at.date() if scheduled_at else 'appointment'}"
     try:
@@ -633,3 +735,34 @@ async def complete_appointment(id: str, session: dict = Depends(require_doctor))
         data={"status": "completed"},
     )
     return {"ok": True, "status": "completed", "message": "Appointment marked as completed."}
+
+
+@router.post("/{id}/confirm-by-patient")
+async def confirm_by_patient(id: str, session: dict = Depends(require_patient)):
+    """Patient confirms a doctor-scheduled appointment (adds card if needed, then confirms).
+    Expects payment method to be attached via /api/payments/confirm-card before calling this.
+    Updates status from pending_confirmation to card_on_file."""
+    db = await get_db()
+    appointment = await db.appointment.find_unique(where={"id": id}, include={"patient": True})
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    patient_id = getattr(appointment, "patientId", None) or getattr(appointment, "patient_id", None)
+    if patient_id != session["id"]:
+        raise HTTPException(status_code=403, detail="Not your appointment")
+    if appointment.status != "pending_confirmation":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Appointment is not pending confirmation (status: {appointment.status})",
+        )
+    patient = await db.user.find_unique(where={"id": patient_id})
+    stripe_cid = getattr(patient, "stripeCustomerId", None) or getattr(patient, "stripe_customer_id", None)
+    if not patient or not stripe_cid:
+        raise HTTPException(
+            status_code=400,
+            detail="Save your card first before confirming.",
+        )
+    await db.appointment.update(
+        where={"id": id},
+        data={"status": "card_on_file"},
+    )
+    return {"ok": True, "status": "card_on_file", "message": "Appointment confirmed. Your card is on file."}
