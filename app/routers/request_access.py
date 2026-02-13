@@ -35,20 +35,30 @@ async def request_access(body: RequestAccessBody):
         )
     db = await get_db()
     email = body.email.strip().lower()
+
+    # Block if user has already completed the full request flow (questionnaire submitted)
+    # — regardless of status: approved, rejected, or pending
+    existing_completed = await db.patientrequest.find_first(
+        where={
+            "email": email,
+            "fhirQuestionnaireResponseId": {"not": None},
+        },
+    )
+    if existing_completed:
+        status = getattr(existing_completed, "status", None) or "pending"
+        if status == "approved":
+            detail = "You already have access. Please log in to your account."
+        elif status == "rejected":
+            detail = "A previous request with this email was not approved. Please contact us if you have questions."
+        else:
+            detail = "You have already submitted a request with this email. We will email you with next steps."
+        raise HTTPException(status_code=409, detail=detail)
+
+    # Incomplete flow: pending, no questionnaire yet → update and continue
     existing = await db.patientrequest.find_first(
         where={"email": email, "status": "pending"},
     )
     if existing:
-        # Already completed questionnaire → block at request access
-        fhir_id = getattr(existing, "fhirQuestionnaireResponseId", None) or getattr(
-            existing, "fhir_questionnaire_response_id", None
-        )
-        if fhir_id:
-            raise HTTPException(
-                status_code=409,
-                detail="You have already submitted a request with this email. We will contact you with next steps.",
-            )
-        # Incomplete flow (no questionnaire yet) → update and continue
         await db.patientrequest.update(
             where={"id": existing.id},
             data={

@@ -30,7 +30,13 @@ def _get_attr(obj, *names, default=None):
     return default
 
 
-def _serialize_appointment(a, include_patient=False, include_doctor=False):
+def _serialize_appointment(
+    a,
+    include_patient=False,
+    include_doctor=False,
+    patient_has_assigned_forms=None,
+    patient_has_pending_clinical_intake=None,
+):
     scheduled_at = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at", None)
     duration = getattr(a, "duration_minutes", None) or getattr(a, "durationMinutes", 60)
     meet_link = getattr(a, "meetLink", None) or getattr(a, "meet_link", None)
@@ -57,6 +63,10 @@ def _serialize_appointment(a, include_patient=False, include_doctor=False):
             "email": d.email,
             "name": f"{_get_attr(d, 'first_name', 'firstName', default='')} {_get_attr(d, 'last_name', 'lastName', default='')}".strip(),
         }
+    if patient_has_assigned_forms is not None:
+        out["patientHasAssignedForms"] = patient_has_assigned_forms
+    if patient_has_pending_clinical_intake is not None:
+        out["patientHasPendingClinicalIntake"] = patient_has_pending_clinical_intake
     return out
 
 
@@ -79,8 +89,12 @@ class SetAllowedFollowupBody(BaseModel):
 class ScheduleForPatientBody(BaseModel):
     patientId: str
     scheduledAt: str  # ISO datetime
-    durationMinutes: int  # 30 or 45
-    type: str  # followup_med_30 or followup_med_therapy_45
+    durationMinutes: int  # 30, 45, or 60 (for clinical_intake)
+    type: str  # followup_med_30 | followup_med_therapy_45 | clinical_intake
+
+
+class RejectAfterOrientationBody(BaseModel):
+    rejectedNote: str | None = None
 
 
 @router.get("/allowed-types")
@@ -118,6 +132,22 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
     )
     no_pending_forms = pending_forms_count == 0
 
+    rejected_after_orientation = getattr(
+        patient_user, "rejectedAfterOrientation", None
+    ) or getattr(patient_user, "rejected_after_orientation", None)
+    if rejected_after_orientation:
+        rejected_after_orientation = True
+
+    # If patient has pending_confirmation clinical intake, don't show clinical intake in book (they must confirm or cancel first)
+    pending_clinical = await db.appointment.find_first(
+        where={
+            "patientId": patient_id,
+            "type": "clinical_intake",
+            "status": "pending_confirmation",
+        },
+    )
+    has_pending_clinical_intake = pending_clinical is not None
+
     allowed = []
     if not has_orientation:
         allowed.append({
@@ -125,7 +155,14 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
             "durationMinutes": APPOINTMENT_TYPES["orientation_consult"]["durationMinutes"],
             "label": APPOINTMENT_TYPES["orientation_consult"]["label"],
         })
-    if has_orientation and is_approved and no_pending_forms and not has_intake:
+    if (
+        has_orientation
+        and is_approved
+        and no_pending_forms
+        and not has_intake
+        and not rejected_after_orientation
+        and not has_pending_clinical_intake
+    ):
         allowed.append({
             "type": "clinical_intake",
             "durationMinutes": APPOINTMENT_TYPES["clinical_intake"]["durationMinutes"],
@@ -160,6 +197,10 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
             not_allowed_reasons["clinical_intake"] = "Complete your initial evaluation (orientation) first."
         elif has_intake:
             not_allowed_reasons["clinical_intake"] = "You've already completed clinical intake."
+        elif rejected_after_orientation:
+            not_allowed_reasons["clinical_intake"] = "The practice has determined this service is not a fit at this time."
+        elif has_pending_clinical_intake:
+            not_allowed_reasons["clinical_intake"] = "You have a scheduled clinical intake. Confirm or change it in your appointments."
         else:
             not_allowed_reasons["clinical_intake"] = "Complete your initial evaluation and get approved first."
     if "followup_med_30" not in allowed_set:
@@ -302,8 +343,38 @@ async def list_appointments_paged(
             "nextCursor": next_cursor,
             "hasMore": has_more,
         }
+
+    # For doctor: add orientation action flags for completed orientation_consult
+    items = []
+    for a in page:
+        has_forms = None
+        has_clinical = None
+        if a.type == "orientation_consult" and getattr(a, "patient", None):
+            patient_id = a.patient.id
+            has_forms = (
+                await db.patientformassignment.count(
+                    where={"patientId": patient_id},
+                )
+            ) > 0
+            has_clinical = (
+                await db.appointment.count(
+                    where={
+                        "patientId": patient_id,
+                        "type": "clinical_intake",
+                        "status": {"in": ["pending_confirmation", "scheduled", "card_on_file", "paid"]},
+                    },
+                )
+            ) > 0
+        items.append(
+            _serialize_appointment(
+                a,
+                include_patient=True,
+                patient_has_assigned_forms=has_forms,
+                patient_has_pending_clinical_intake=has_clinical,
+            )
+        )
     return {
-        "items": [_serialize_appointment(a, include_patient=True) for a in page],
+        "items": items,
         "nextCursor": next_cursor,
         "hasMore": has_more,
     }
@@ -371,6 +442,12 @@ async def create_appointment(
             raise HTTPException(status_code=403, detail="Your access must be approved before booking clinical intake.")
         if not no_pending_forms:
             raise HTTPException(status_code=403, detail="Complete your assigned forms before booking clinical intake.")
+        rejected = getattr(patient_user, "rejectedAfterOrientation", None) or getattr(patient_user, "rejected_after_orientation", None)
+        if rejected:
+            raise HTTPException(
+                status_code=403,
+                detail="The practice has determined this service is not a fit at this time.",
+            )
     if body.type in ("followup_med_30", "followup_med_therapy_45"):
         if not has_intake:
             raise HTTPException(status_code=403, detail="Complete clinical intake before booking follow-ups.")
@@ -555,9 +632,46 @@ async def set_patient_allowed_followup_types(
     return {"ok": True, "allowedTypes": valid}
 
 
+@router.post("/{id}/reject-after-orientation")
+async def reject_after_orientation(
+    id: str,
+    body: RejectAfterOrientationBody,
+    session: dict = Depends(require_doctor),
+):
+    """Mark patient as rejected after orientation. Clinical intake will no longer be shown to them."""
+    db = await get_db()
+    appointment = await db.appointment.find_unique(
+        where={"id": id},
+        include={"patient": True},
+    )
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    doctor_id = getattr(appointment, "doctorId", None) or getattr(appointment, "doctor_id", None)
+    if doctor_id != session["id"]:
+        raise HTTPException(status_code=403, detail="Not your appointment")
+    if getattr(appointment, "type", None) != "orientation_consult":
+        raise HTTPException(
+            status_code=400,
+            detail="Can only reject after orientation for a completed orientation appointment.",
+        )
+    if getattr(appointment, "status", None) not in ("completed", "paid"):
+        raise HTTPException(
+            status_code=400,
+            detail="Orientation must be completed before rejecting.",
+        )
+    patient_id = getattr(appointment, "patientId", None) or getattr(appointment, "patient_id", None)
+    if not patient_id:
+        raise HTTPException(status_code=400, detail="Appointment has no patient")
+    await db.user.update(
+        where={"id": patient_id},
+        data={"rejectedAfterOrientation": True},
+    )
+    return {"ok": True, "message": "Patient will no longer see clinical intake option."}
+
+
 @router.post("/schedule-for-patient")
 async def schedule_for_patient(body: ScheduleForPatientBody, session: dict = Depends(require_doctor)):
-    """Doctor schedules a follow-up for a patient. Creates appointment with status pending_confirmation.
+    """Doctor schedules a follow-up or clinical intake for a patient. Creates appointment with status pending_confirmation.
     Patient will then add card and confirm."""
     db = await get_db()
     doctor = await db.user.find_first(where={"role": "doctor"})
@@ -566,23 +680,65 @@ async def schedule_for_patient(body: ScheduleForPatientBody, session: dict = Dep
     patient = await db.user.find_unique(where={"id": body.patientId})
     if not patient or patient.role != "patient":
         raise HTTPException(status_code=404, detail="Patient not found")
-    if body.type not in ("followup_med_30", "followup_med_therapy_45"):
-        raise HTTPException(status_code=400, detail="Type must be followup_med_30 or followup_med_therapy_45")
-    raw = getattr(patient, "allowedFollowupTypes", None) or getattr(patient, "allowed_followup_types", None)
-    allowed_list = [t for t in (raw if isinstance(raw, list) else []) if t in ("followup_med_30", "followup_med_therapy_45")]
-    if body.type not in allowed_list:
-        raise HTTPException(
-            status_code=400,
-            detail="Patient is not assigned this follow-up type. Set allowed follow-up types first.",
+
+    if body.type == "clinical_intake":
+        if body.durationMinutes != 60:
+            raise HTTPException(status_code=400, detail="Clinical intake must be 60 minutes")
+        completed = await db.appointment.find_many(
+            where={
+                "patientId": body.patientId,
+                "status": {"in": ["completed", "paid"]},
+            },
         )
+        completed_types = {a.type for a in completed}
+        if "orientation_consult" not in completed_types:
+            raise HTTPException(
+                status_code=400,
+                detail="Patient must complete orientation before scheduling clinical intake.",
+            )
+        if "clinical_intake" in completed_types or "intake" in completed_types:
+            raise HTTPException(
+                status_code=400,
+                detail="Patient has already completed clinical intake.",
+            )
+        rejected = getattr(patient, "rejectedAfterOrientation", None) or getattr(patient, "rejected_after_orientation", None)
+        if rejected:
+            raise HTTPException(
+                status_code=400,
+                detail="Patient was rejected after orientation.",
+            )
+        existing = await db.appointment.find_first(
+            where={
+                "patientId": body.patientId,
+                "type": "clinical_intake",
+                "status": {"in": ["pending_confirmation", "scheduled", "card_on_file"]},
+            },
+        )
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="Patient already has a pending or scheduled clinical intake.",
+            )
+    else:
+        if body.type not in ("followup_med_30", "followup_med_therapy_45"):
+            raise HTTPException(status_code=400, detail="Type must be followup_med_30, followup_med_therapy_45, or clinical_intake")
+        raw = getattr(patient, "allowedFollowupTypes", None) or getattr(patient, "allowed_followup_types", None)
+        allowed_list = [t for t in (raw if isinstance(raw, list) else []) if t in ("followup_med_30", "followup_med_therapy_45")]
+        # If no types set, allow both (doctor can schedule any follow-up after clinical intake)
+        if allowed_list and body.type not in allowed_list:
+            raise HTTPException(
+                status_code=400,
+                detail="Patient is not assigned this follow-up type. Set allowed follow-up types first.",
+            )
+        if body.durationMinutes not in (30, 45):
+            raise HTTPException(status_code=400, detail="durationMinutes must be 30 or 45")
+
     try:
         scheduled_at = datetime.fromisoformat(body.scheduledAt.replace("Z", "+00:00"))
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid scheduledAt (use ISO format)")
     if scheduled_at.tzinfo is None:
         scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
-    if body.durationMinutes not in (30, 45):
-        raise HTTPException(status_code=400, detail="durationMinutes must be 30 or 45")
     apt = await db.appointment.create(
         data={
             "patientId": body.patientId,
@@ -741,9 +897,13 @@ async def complete_appointment(id: str, session: dict = Depends(require_doctor))
 async def confirm_by_patient(id: str, session: dict = Depends(require_patient)):
     """Patient confirms a doctor-scheduled appointment (adds card if needed, then confirms).
     Expects payment method to be attached via /api/payments/confirm-card before calling this.
-    Updates status from pending_confirmation to card_on_file."""
+    Updates status from pending_confirmation to card_on_file.
+    Creates Google Meet link and sends confirmation email with appointment details."""
     db = await get_db()
-    appointment = await db.appointment.find_unique(where={"id": id}, include={"patient": True})
+    appointment = await db.appointment.find_unique(
+        where={"id": id},
+        include={"patient": True, "doctor": True},
+    )
     if not appointment:
         raise HTTPException(status_code=404, detail="Appointment not found")
     patient_id = getattr(appointment, "patientId", None) or getattr(appointment, "patient_id", None)
@@ -761,8 +921,69 @@ async def confirm_by_patient(id: str, session: dict = Depends(require_patient)):
             status_code=400,
             detail="Save your card first before confirming.",
         )
+    # For clinical intake, patient must complete assigned forms before confirming
+    apt_type = getattr(appointment, "type", None) or ""
+    if apt_type == "clinical_intake":
+        pending_forms = await db.patientformassignment.count(
+            where={
+                "patientId": patient_id,
+                "status": "pending",
+            },
+        )
+        if pending_forms > 0:
+            raise HTTPException(
+                status_code=403,
+                detail="Complete your assigned forms before confirming. Visit Forms & Documents to complete them.",
+            )
+
+    # Create Google Meet link (when doctor has Calendar connected)
+    meet_link = None
+    doctor = getattr(appointment, "doctor", None)
+    patient_user = getattr(appointment, "patient", None)
+    scheduled_at = getattr(appointment, "scheduledAt", None) or getattr(appointment, "scheduled_at", None)
+    duration_min = getattr(appointment, "durationMinutes", None) or getattr(appointment, "duration_minutes", 60)
+
+    if doctor and scheduled_at:
+        refresh_token = getattr(doctor, "googleRefreshToken", None) or getattr(doctor, "google_refresh_token", None)
+        calendar_id = getattr(doctor, "googleCalendarId", None) or getattr(doctor, "google_calendar_id", None) or "primary"
+        patient_email = getattr(patient_user, "email", None) if patient_user else None
+        patient_name = "Patient"
+        if patient_user:
+            patient_name = (
+                f"{getattr(patient_user, 'firstName', None) or getattr(patient_user, 'first_name', '')} "
+                f"{getattr(patient_user, 'lastName', None) or getattr(patient_user, 'last_name', '')}"
+            ).strip() or "Patient"
+
+        if refresh_token:
+            from app.google_calendar import create_calendar_event_with_meet
+            end_utc = scheduled_at + timedelta(minutes=duration_min)
+            meet_link = create_calendar_event_with_meet(
+                refresh_token=refresh_token,
+                calendar_id=calendar_id,
+                start_utc=scheduled_at,
+                end_utc=end_utc,
+                summary=f"TelePsych — {patient_name}",
+                description="Appointment confirmed via TelePsych.",
+                attendee_email=patient_email,
+            )
+
+    # Update appointment with status and Meet link
     await db.appointment.update(
         where={"id": id},
-        data={"status": "card_on_file"},
+        data={
+            "status": "card_on_file",
+            "meetLink": meet_link,
+        },
     )
+
+    # Send confirmation email with appointment details and Meet link
+    if patient_user and scheduled_at:
+        from app.email_service import send_appointment_confirmation_email
+        send_appointment_confirmation_email(
+            to=patient_user.email,
+            patient_first_name=patient_name,
+            scheduled_at_iso=scheduled_at.isoformat(),
+            meet_link=meet_link,
+        )
+
     return {"ok": True, "status": "card_on_file", "message": "Appointment confirmed. Your card is on file."}

@@ -217,6 +217,7 @@ async def get_patient_overview(
         form = getattr(fa, "form", None)
         submission = getattr(fa, "submission", None)
         
+        fhir_id = getattr(fa, "fhirResponseId", None) or getattr(fa, "fhir_response_id", None)
         assignment_data = {
             "id": fa.id,
             "formId": fa.formId if hasattr(fa, "formId") else getattr(fa, "form_id", ""),
@@ -225,9 +226,15 @@ async def get_patient_overview(
             "status": fa.status,
             "assignedAt": getattr(fa, "assignedAt", None) or getattr(fa, "assigned_at", None),
             "completedAt": getattr(fa, "completedAt", None) or getattr(fa, "completed_at", None),
-            "fhirResponseId": getattr(fa, "fhirResponseId", None) or getattr(fa, "fhir_response_id", None),
+            "fhirResponseId": fhir_id,
             "uploadedGcsPath": getattr(fa, "uploadedGcsPath", None) or getattr(fa, "uploaded_gcs_path", None),
         }
+        
+        # For questionnaire forms: fetch Q&A from FHIR for display (instead of raw response ID)
+        if form and form.type == "questionnaire" and fhir_id:
+            qa_data = get_questionnaire_response_as_form_data(fhir_id)
+            if qa_data:
+                assignment_data["questionnaireData"] = qa_data
         
         # Add download URL for PDF uploads
         if form and form.type == "pdf_upload" and assignment_data["uploadedGcsPath"]:

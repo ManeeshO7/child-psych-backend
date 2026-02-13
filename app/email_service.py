@@ -103,12 +103,12 @@ def _send_email(to: str, subject: str, html: str) -> tuple[bool, Optional[str]]:
     try:
         import resend
         resend.api_key = api_key
+        # click_tracking is domain-level only in Resend; run scripts/disable_resend_click_tracking.py to disable
         r = resend.Emails.send({
             "from": from_addr,
             "to": [to],
             "subject": subject,
             "html": html,
-            "click_tracking": False,  # Disable click tracking to avoid Spectrum/ISP security blocks
         })
         # Resend returns dict with "id" on success; SDK may also return object with .id
         email_id = r.get("id") if isinstance(r, dict) else getattr(r, "id", None)

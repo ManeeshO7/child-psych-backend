@@ -36,6 +36,7 @@ model User {
   stripeCustomerId     String?   @unique @map("stripe_customer_id")
   formAssignments PatientFormAssignment[] @relation("PatientFormAssignments")
   allowedFollowupTypes Json? @map("allowed_followup_types") // ["followup_med_30", "followup_med_therapy_45"] set by doctor after intake
+  rejectedAfterOrientation Boolean? @map("rejected_after_orientation") // true = doctor rejected after orientation; clinical intake hidden
   @@map("users")
 }
 
