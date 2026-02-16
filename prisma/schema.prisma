@@ -111,6 +111,7 @@ model Appointment {
   type           String   @default("followup") // orientation_consult | clinical_intake | followup_med_30 | followup_med_therapy_45 | intake | followup | post_intake (legacy)
   notes          String?  @db.Text
   meetLink       String?  @map("meet_link")
+  googleCalendarEventId String? @map("google_calendar_event_id") // For update/delete on reschedule or cancel
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
   

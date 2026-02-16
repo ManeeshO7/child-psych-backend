@@ -392,12 +392,16 @@ async def set_offered_slots(body: OfferedSlotsIn, session: dict = Depends(requir
 
 
 @router.get("/slots")
-async def get_available_slots(durationMinutes: int | None = None):
+async def get_available_slots(
+    durationMinutes: int | None = None,
+    excludeAppointmentId: str | None = None,
+):
     """
     Return bookable slots for patients. Only slots the doctor has explicitly offered
     for this duration are returned; booked slots are excluded.
 
     - durationMinutes: 30, 45, or 60. Defaults to SLOT_MINUTES when not provided.
+    - excludeAppointmentId: when rescheduling, exclude this appointment so its current slot appears available.
     """
     db = await get_db()
     doctor = await db.user.find_first(where={"role": "doctor"})
@@ -431,6 +435,8 @@ async def get_available_slots(durationMinutes: int | None = None):
     )
     existing_intervals: list[tuple[datetime, datetime]] = []
     for a in appointments:
+        if excludeAppointmentId and a.id == excludeAppointmentId:
+            continue
         s = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at")
         if not s:
             continue

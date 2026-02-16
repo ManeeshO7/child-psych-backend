@@ -12,6 +12,21 @@ from prisma import fields as prisma_fields
 
 router = APIRouter(prefix="/api/appointments", tags=["appointments"])
 
+CALENDAR_TOKEN_EXPIRED_MSG = (
+    "Your Google Calendar connection has expired. Please go to the doctor dashboard and reconnect "
+    "Google Calendar to enable Meet links for appointments."
+)
+
+
+async def _clear_doctor_calendar_token_and_raise(db, doctor_id: str):
+    """Clear expired Google Calendar token so UI shows reconnect prompt."""
+    await db.user.update(
+        where={"id": doctor_id},
+        data={"googleRefreshToken": None},
+    )
+    raise HTTPException(status_code=400, detail=CALENDAR_TOKEN_EXPIRED_MSG)
+
+
 # Appointment types and phase gating
 APPOINTMENT_TYPES = {
     "orientation_consult": {"durationMinutes": 30, "label": "Orientation consultation"},
@@ -36,6 +51,7 @@ def _serialize_appointment(
     include_doctor=False,
     patient_has_assigned_forms=None,
     patient_has_pending_clinical_intake=None,
+    patient_has_scheduled_followup=None,
 ):
     scheduled_at = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at", None)
     duration = getattr(a, "duration_minutes", None) or getattr(a, "durationMinutes", 60)
@@ -67,6 +83,8 @@ def _serialize_appointment(
         out["patientHasAssignedForms"] = patient_has_assigned_forms
     if patient_has_pending_clinical_intake is not None:
         out["patientHasPendingClinicalIntake"] = patient_has_pending_clinical_intake
+    if patient_has_scheduled_followup is not None:
+        out["patientHasScheduledFollowup"] = patient_has_scheduled_followup
     return out
 
 
@@ -95,6 +113,10 @@ class ScheduleForPatientBody(BaseModel):
 
 class RejectAfterOrientationBody(BaseModel):
     rejectedNote: str | None = None
+
+
+class RescheduleAppointmentBody(BaseModel):
+    scheduledAt: str  # ISO datetime for new slot
 
 
 @router.get("/allowed-types")
@@ -344,33 +366,46 @@ async def list_appointments_paged(
             "hasMore": has_more,
         }
 
-    # For doctor: add orientation action flags for completed orientation_consult
+    # For doctor: add orientation/intake action flags
     items = []
     for a in page:
         has_forms = None
         has_clinical = None
-        if a.type == "orientation_consult" and getattr(a, "patient", None):
+        has_scheduled_followup = None
+        if getattr(a, "patient", None):
             patient_id = a.patient.id
-            has_forms = (
-                await db.patientformassignment.count(
-                    where={"patientId": patient_id},
-                )
-            ) > 0
-            has_clinical = (
-                await db.appointment.count(
-                    where={
-                        "patientId": patient_id,
-                        "type": "clinical_intake",
-                        "status": {"in": ["pending_confirmation", "scheduled", "card_on_file", "paid"]},
-                    },
-                )
-            ) > 0
+            if a.type == "orientation_consult":
+                has_forms = (
+                    await db.patientformassignment.count(
+                        where={"patientId": patient_id},
+                    )
+                ) > 0
+                has_clinical = (
+                    await db.appointment.count(
+                        where={
+                            "patientId": patient_id,
+                            "type": "clinical_intake",
+                            "status": {"in": ["pending_confirmation", "scheduled", "card_on_file", "paid"]},
+                        },
+                    )
+                ) > 0
+            if a.type in ("orientation_consult", "clinical_intake", "intake") and a.status == "completed":
+                has_scheduled_followup = (
+                    await db.appointment.count(
+                        where={
+                            "patientId": patient_id,
+                            "type": {"in": ["followup_med_30", "followup_med_therapy_45"]},
+                            "status": {"in": ["pending_confirmation", "scheduled", "card_on_file", "paid"]},
+                        },
+                    )
+                ) > 0
         items.append(
             _serialize_appointment(
                 a,
                 include_patient=True,
                 patient_has_assigned_forms=has_forms,
                 patient_has_pending_clinical_intake=has_clinical,
+                patient_has_scheduled_followup=has_scheduled_followup,
             )
         )
     return {
@@ -553,20 +588,24 @@ async def create_appointment(
         patient_email = getattr(patient_user, "email", None)
 
     meet_link = None
+    google_calendar_event_id = None
     refresh_token = getattr(doctor, "googleRefreshToken", None) or getattr(doctor, "google_refresh_token", None)
     calendar_id = getattr(doctor, "googleCalendarId", None) or getattr(doctor, "google_calendar_id", None) or "primary"
     if refresh_token:
-        from app.google_calendar import create_calendar_event_with_meet
-        end_utc = scheduled_at + timedelta(minutes=body.durationMinutes or SLOT_MINUTES)
-        meet_link = create_calendar_event_with_meet(
-            refresh_token=refresh_token,
-            calendar_id=calendar_id,
-            start_utc=scheduled_at,
-            end_utc=end_utc,
-            summary=f"TelePsych — {patient_name}",
-            description="Appointment booked via TelePsych.",
-            attendee_email=patient_email,
-        )
+        from app.google_calendar import GoogleCalendarTokenExpiredError, create_calendar_event_with_meet
+        try:
+            end_utc = scheduled_at + timedelta(minutes=body.durationMinutes or SLOT_MINUTES)
+            meet_link, google_calendar_event_id = create_calendar_event_with_meet(
+                refresh_token=refresh_token,
+                calendar_id=calendar_id,
+                start_utc=scheduled_at,
+                end_utc=end_utc,
+                summary=f"TelePsych — {patient_name}",
+                description="Appointment booked via TelePsych.",
+                attendee_email=patient_email,
+            )
+        except GoogleCalendarTokenExpiredError:
+            await _clear_doctor_calendar_token_and_raise(db, doctor.id)
 
     # If the patient already has a Stripe customer with a saved card, mark this as card_on_file.
     stripe_customer_id = getattr(patient_user, "stripeCustomerId", None) or getattr(
@@ -584,6 +623,7 @@ async def create_appointment(
             "notes": body.notes,
             "status": status,
             "meetLink": meet_link,
+            "googleCalendarEventId": google_calendar_event_id,
         },
     )
     # Send confirmation email with Meet link
@@ -800,6 +840,31 @@ async def update_appointment(
         data["status"] = body.status
     if body.notes is not None:
         data["notes"] = body.notes
+
+    # When cancelling, delete the Google Calendar event if we have it
+    if body.status == "cancelled":
+        event_id = getattr(appointment, "googleCalendarEventId", None) or getattr(
+            appointment, "google_calendar_event_id", None
+        )
+        if event_id:
+            doctor = await db.user.find_unique(
+                where={"id": (getattr(appointment, "doctorId", None) or getattr(appointment, "doctor_id", None))}
+            )
+            if doctor:
+                refresh_token = getattr(doctor, "googleRefreshToken", None) or getattr(doctor, "google_refresh_token", None)
+                calendar_id = getattr(doctor, "googleCalendarId", None) or getattr(doctor, "google_calendar_id", None) or "primary"
+                if refresh_token:
+                    from app.google_calendar import GoogleCalendarTokenExpiredError, delete_calendar_event
+                    try:
+                        delete_calendar_event(
+                            refresh_token=refresh_token,
+                            calendar_id=calendar_id,
+                            event_id=event_id,
+                        )
+                    except GoogleCalendarTokenExpiredError:
+                        await _clear_doctor_calendar_token_and_raise(db, doctor.id)
+            data["googleCalendarEventId"] = None  # Clear so we don't try to delete again
+
     if not data:
         return _serialize_appointment(appointment)
     updated = await db.appointment.update(
@@ -807,6 +872,325 @@ async def update_appointment(
         data=data,
         include={"patient": True, "doctor": True},
     )
+    return _serialize_appointment(updated, include_patient=True, include_doctor=True)
+
+
+RESCHEDULE_MIN_HOURS_BEFORE = 48
+RESCHEDULABLE_STATUSES = {"scheduled", "card_on_file", "paid"}
+
+
+@router.post("/{id}/change-proposed-time")
+async def change_proposed_time(
+    id: str,
+    body: RescheduleAppointmentBody,
+    session: dict = Depends(require_patient_or_doctor),
+):
+    """
+    Change the proposed time for a pending_confirmation appointment.
+    Patient or doctor can pick a new slot before the patient confirms.
+    No calendar/Meet/email - those are created on confirm.
+    """
+    db = await get_db()
+    appointment = await db.appointment.find_unique(
+        where={"id": id},
+        include={"patient": True, "doctor": True},
+    )
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    role = session["role"]
+    patient_id = getattr(appointment, "patientId", None) or getattr(appointment, "patient_id", None)
+    doctor_id = getattr(appointment, "doctorId", None) or getattr(appointment, "doctor_id", None)
+    if role == "patient" and patient_id != session["id"]:
+        raise HTTPException(status_code=403, detail="Not your appointment")
+    if role == "doctor" and doctor_id != session["id"]:
+        raise HTTPException(status_code=403, detail="Not your appointment")
+
+    status = getattr(appointment, "status", None)
+    if status != "pending_confirmation":
+        raise HTTPException(
+            status_code=400,
+            detail="Can only change proposed time for appointments pending confirmation.",
+        )
+
+    try:
+        new_scheduled_at = datetime.fromisoformat(body.scheduledAt.replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid scheduledAt (use ISO format)")
+    if new_scheduled_at.tzinfo is None:
+        new_scheduled_at = new_scheduled_at.replace(tzinfo=timezone.utc)
+
+    new_scheduled_practice = new_scheduled_at.astimezone(PRACTICE_TZ)
+    slot_minutes = new_scheduled_practice.hour * 60 + new_scheduled_practice.minute
+    if slot_minutes % 15 != 0 or new_scheduled_practice.second != 0 or new_scheduled_practice.microsecond != 0:
+        raise HTTPException(
+            status_code=400,
+            detail="scheduledAt must be a 15-minute slot start (e.g. 10:00, 10:15, 10:30)",
+        )
+
+    duration_minutes = getattr(appointment, "durationMinutes", None) or getattr(appointment, "duration_minutes", 60)
+    doctor = await db.user.find_unique(where={"id": doctor_id})
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    now_practice = datetime.now(PRACTICE_TZ)
+    if new_scheduled_practice < now_practice:
+        raise HTTPException(status_code=400, detail="Cannot change to a time in the past")
+
+    day = new_scheduled_practice.date()
+    day_start = datetime.combine(day, time(0, 0), tzinfo=PRACTICE_TZ)
+    day_end = datetime.combine(day, time(23, 59), tzinfo=PRACTICE_TZ)
+    start_hhmm = new_scheduled_practice.strftime("%H:%M")
+
+    offered = await db.doctorbookableslot.find_first(
+        where={
+            "doctorId": doctor_id,
+            "date": {"gte": f"{day.isoformat()}T00:00:00.000Z", "lte": f"{day.isoformat()}T23:59:59.999Z"},
+            "startTime": start_hhmm,
+            "durationMinutes": duration_minutes,
+        },
+    )
+    if not offered:
+        raise HTTPException(
+            status_code=409,
+            detail="This time is no longer available. Please choose another time.",
+        )
+
+    existing_appointments = await db.appointment.find_many(
+        where={
+            "doctorId": doctor_id,
+            "status": {"not": "cancelled"},
+            "scheduledAt": {"gte": day_start, "lte": day_end},
+        },
+    )
+
+    candidate_start = new_scheduled_practice
+    candidate_end = candidate_start + timedelta(minutes=duration_minutes)
+
+    for a in existing_appointments:
+        if a.id == id:
+            continue
+        s = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at", None)
+        if not s:
+            continue
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=timezone.utc).astimezone(PRACTICE_TZ)
+        else:
+            s = s.astimezone(PRACTICE_TZ)
+        dur = getattr(a, "durationMinutes", None) or getattr(a, "duration_minutes", SLOT_MINUTES)
+        e = s + timedelta(minutes=dur)
+        if candidate_start < e and s < candidate_end:
+            raise HTTPException(
+                status_code=409,
+                detail="This time is no longer available. Please choose another time.",
+            )
+
+    updated = await db.appointment.update(
+        where={"id": id},
+        data={"scheduledAt": new_scheduled_at},
+        include={"patient": True, "doctor": True},
+    )
+
+    return _serialize_appointment(updated, include_patient=True, include_doctor=True)
+
+
+@router.post("/{id}/reschedule")
+async def reschedule_appointment(
+    id: str,
+    body: RescheduleAppointmentBody,
+    session: dict = Depends(require_patient_or_doctor),
+):
+    """
+    Reschedule an appointment to a new time.
+    Allowed until 48 hours before the appointment. Patient and doctor can both reschedule.
+    """
+    db = await get_db()
+    appointment = await db.appointment.find_unique(
+        where={"id": id},
+        include={"patient": True, "doctor": True},
+    )
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    role = session["role"]
+    patient_id = getattr(appointment, "patientId", None) or getattr(appointment, "patient_id", None)
+    doctor_id = getattr(appointment, "doctorId", None) or getattr(appointment, "doctor_id", None)
+    if role == "patient" and patient_id != session["id"]:
+        raise HTTPException(status_code=403, detail="Not your appointment")
+    if role == "doctor" and doctor_id != session["id"]:
+        raise HTTPException(status_code=403, detail="Not your appointment")
+
+    status = getattr(appointment, "status", None)
+    if status not in RESCHEDULABLE_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot reschedule appointment with status '{status}'.",
+        )
+
+    scheduled_at = getattr(appointment, "scheduledAt", None) or getattr(appointment, "scheduled_at", None)
+    if not scheduled_at:
+        raise HTTPException(status_code=400, detail="Appointment has no scheduled time")
+    if scheduled_at.tzinfo is None:
+        scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    hours_until = (scheduled_at - now).total_seconds() / 3600
+    if hours_until < RESCHEDULE_MIN_HOURS_BEFORE:
+        raise HTTPException(
+            status_code=400,
+            detail="Reschedule is only allowed until 48 hours before the appointment.",
+        )
+
+    try:
+        new_scheduled_at = datetime.fromisoformat(body.scheduledAt.replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid scheduledAt (use ISO format)")
+    if new_scheduled_at.tzinfo is None:
+        new_scheduled_at = new_scheduled_at.replace(tzinfo=timezone.utc)
+
+    new_scheduled_practice = new_scheduled_at.astimezone(PRACTICE_TZ)
+    slot_minutes = new_scheduled_practice.hour * 60 + new_scheduled_practice.minute
+    if slot_minutes % 15 != 0 or new_scheduled_practice.second != 0 or new_scheduled_practice.microsecond != 0:
+        raise HTTPException(
+            status_code=400,
+            detail="scheduledAt must be a 15-minute slot start (e.g. 10:00, 10:15, 10:30)",
+        )
+
+    duration_minutes = getattr(appointment, "durationMinutes", None) or getattr(appointment, "duration_minutes", 60)
+    apt_type = getattr(appointment, "type", None) or "orientation_consult"
+
+    doctor = await db.user.find_unique(where={"id": doctor_id})
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+
+    now_practice = datetime.now(PRACTICE_TZ)
+    if new_scheduled_practice < now_practice:
+        raise HTTPException(status_code=400, detail="Cannot reschedule to a time in the past")
+
+    day = new_scheduled_practice.date()
+    day_start = datetime.combine(day, time(0, 0), tzinfo=PRACTICE_TZ)
+    day_end = datetime.combine(day, time(23, 59), tzinfo=PRACTICE_TZ)
+    start_hhmm = new_scheduled_practice.strftime("%H:%M")
+
+    offered = await db.doctorbookableslot.find_first(
+        where={
+            "doctorId": doctor_id,
+            "date": {"gte": f"{day.isoformat()}T00:00:00.000Z", "lte": f"{day.isoformat()}T23:59:59.999Z"},
+            "startTime": start_hhmm,
+            "durationMinutes": duration_minutes,
+        },
+    )
+    if not offered:
+        raise HTTPException(
+            status_code=409,
+            detail="This time is no longer available. Please choose another time.",
+        )
+
+    existing_appointments = await db.appointment.find_many(
+        where={
+            "doctorId": doctor_id,
+            "status": {"not": "cancelled"},
+            "scheduledAt": {"gte": day_start, "lte": day_end},
+        },
+    )
+
+    candidate_start = new_scheduled_practice
+    candidate_end = candidate_start + timedelta(minutes=duration_minutes)
+
+    for a in existing_appointments:
+        if a.id == id:
+            continue
+        s = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at", None)
+        if not s:
+            continue
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=timezone.utc).astimezone(PRACTICE_TZ)
+        else:
+            s = s.astimezone(PRACTICE_TZ)
+        dur = getattr(a, "durationMinutes", None) or getattr(a, "duration_minutes", SLOT_MINUTES)
+        e = s + timedelta(minutes=dur)
+        if candidate_start < e and s < candidate_end:
+            raise HTTPException(
+                status_code=409,
+                detail="This time is no longer available. Please choose another time.",
+            )
+
+    meet_link = getattr(appointment, "meetLink", None) or getattr(appointment, "meet_link", None)
+    google_calendar_event_id = getattr(appointment, "googleCalendarEventId", None) or getattr(
+        appointment, "google_calendar_event_id", None
+    )
+    refresh_token = getattr(doctor, "googleRefreshToken", None) or getattr(doctor, "google_refresh_token", None)
+    calendar_id = getattr(doctor, "googleCalendarId", None) or getattr(doctor, "google_calendar_id", None) or "primary"
+
+    if refresh_token and getattr(appointment, "patient", None):
+        patient_user = appointment.patient
+        patient_name = (
+            f"{_get_attr(patient_user, 'firstName', 'first_name', default='')} {_get_attr(patient_user, 'lastName', 'last_name', default='')}".strip()
+            or "Patient"
+        )
+        patient_email = getattr(patient_user, "email", None)
+        end_utc = new_scheduled_at + timedelta(minutes=duration_minutes)
+
+        if google_calendar_event_id:
+            # Update existing calendar event (preserves Meet link)
+            from app.google_calendar import GoogleCalendarTokenExpiredError, update_calendar_event
+            try:
+                updated_meet_link = update_calendar_event(
+                    refresh_token=refresh_token,
+                    calendar_id=calendar_id,
+                    event_id=google_calendar_event_id,
+                    start_utc=new_scheduled_at,
+                    end_utc=end_utc,
+                    existing_meet_link=meet_link,
+                )
+                if updated_meet_link is not None:
+                    meet_link = updated_meet_link
+            except GoogleCalendarTokenExpiredError:
+                await _clear_doctor_calendar_token_and_raise(db, doctor_id)
+        else:
+            # No event ID: create new calendar event (e.g. legacy or doctor-scheduled before confirm)
+            from app.google_calendar import GoogleCalendarTokenExpiredError, create_calendar_event_with_meet
+            try:
+                meet_link, google_calendar_event_id = create_calendar_event_with_meet(
+                    refresh_token=refresh_token,
+                    calendar_id=calendar_id,
+                    start_utc=new_scheduled_at,
+                    end_utc=end_utc,
+                    summary=f"TelePsych — {patient_name}",
+                    description="Appointment rescheduled via TelePsych.",
+                    attendee_email=patient_email,
+                )
+            except GoogleCalendarTokenExpiredError:
+                await _clear_doctor_calendar_token_and_raise(db, doctor_id)
+
+    update_data: dict = {"scheduledAt": new_scheduled_at}
+    if meet_link is not None:
+        update_data["meetLink"] = meet_link
+    if google_calendar_event_id is not None:
+        update_data["googleCalendarEventId"] = google_calendar_event_id
+
+    updated = await db.appointment.update(
+        where={"id": id},
+        data=update_data,
+        include={"patient": True, "doctor": True},
+    )
+
+    # Send reschedule email to patient with new date/time and Google Meet link
+    patient_user = getattr(updated, "patient", None)
+    if patient_user:
+        from app.email_service import send_appointment_rescheduled_email
+        patient_name = (
+            f"{_get_attr(patient_user, 'firstName', 'first_name', default='')} {_get_attr(patient_user, 'lastName', 'last_name', default='')}".strip()
+            or "Patient"
+        )
+        final_meet_link = getattr(updated, "meetLink", None) or getattr(updated, "meet_link", None) or meet_link
+        send_appointment_rescheduled_email(
+            to=patient_user.email,
+            patient_first_name=patient_name,
+            scheduled_at_iso=new_scheduled_at.isoformat(),
+            meet_link=final_meet_link,
+        )
+
     return _serialize_appointment(updated, include_patient=True, include_doctor=True)
 
 
@@ -938,6 +1322,7 @@ async def confirm_by_patient(id: str, session: dict = Depends(require_patient)):
 
     # Create Google Meet link (when doctor has Calendar connected)
     meet_link = None
+    google_calendar_event_id = None
     doctor = getattr(appointment, "doctor", None)
     patient_user = getattr(appointment, "patient", None)
     scheduled_at = getattr(appointment, "scheduledAt", None) or getattr(appointment, "scheduled_at", None)
@@ -955,24 +1340,28 @@ async def confirm_by_patient(id: str, session: dict = Depends(require_patient)):
             ).strip() or "Patient"
 
         if refresh_token:
-            from app.google_calendar import create_calendar_event_with_meet
-            end_utc = scheduled_at + timedelta(minutes=duration_min)
-            meet_link = create_calendar_event_with_meet(
-                refresh_token=refresh_token,
-                calendar_id=calendar_id,
-                start_utc=scheduled_at,
-                end_utc=end_utc,
-                summary=f"TelePsych — {patient_name}",
-                description="Appointment confirmed via TelePsych.",
-                attendee_email=patient_email,
-            )
+            from app.google_calendar import GoogleCalendarTokenExpiredError, create_calendar_event_with_meet
+            try:
+                end_utc = scheduled_at + timedelta(minutes=duration_min)
+                meet_link, google_calendar_event_id = create_calendar_event_with_meet(
+                    refresh_token=refresh_token,
+                    calendar_id=calendar_id,
+                    start_utc=scheduled_at,
+                    end_utc=end_utc,
+                    summary=f"TelePsych — {patient_name}",
+                    description="Appointment confirmed via TelePsych.",
+                    attendee_email=patient_email,
+                )
+            except GoogleCalendarTokenExpiredError:
+                await _clear_doctor_calendar_token_and_raise(db, doctor.id)
 
-    # Update appointment with status and Meet link
+    # Update appointment with status, Meet link, and calendar event ID
     await db.appointment.update(
         where={"id": id},
         data={
             "status": "card_on_file",
             "meetLink": meet_link,
+            "googleCalendarEventId": google_calendar_event_id,
         },
     )
 

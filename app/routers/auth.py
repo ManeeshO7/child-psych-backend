@@ -179,7 +179,30 @@ async def calendar_status(session: dict = Depends(require_doctor)):
     if not user:
         raise HTTPException(status_code=401, detail="Not found")
     refresh = getattr(user, "googleRefreshToken", None) or getattr(user, "google_refresh_token", None)
-    return {"connected": bool(refresh)}
+    if not refresh:
+        return {"connected": False}
+
+    # Validate token by attempting a minimal Calendar API call (list calendars, limit 1)
+    try:
+        from app.google_calendar import get_credentials_from_refresh_token
+        from googleapiclient.discovery import build
+        from google.auth.exceptions import RefreshError
+
+        creds = get_credentials_from_refresh_token(refresh)
+        if not creds:
+            return {"connected": False}
+        service = build("calendar", "v3", credentials=creds)
+        service.calendarList().list(maxResults=1).execute()
+        return {"connected": True}
+    except RefreshError:
+        # Token expired or revoked - clear it so UI shows reconnect prompt
+        await db.user.update(
+            where={"id": session["id"]},
+            data={"googleRefreshToken": None},
+        )
+        return {"connected": False}
+    except Exception:
+        return {"connected": False}
 
 
 @router.post("/reset-password")

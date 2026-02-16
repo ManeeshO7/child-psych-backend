@@ -37,7 +37,15 @@ def create_setup_intent(customer_id: str) -> str:
 
 def set_default_payment_method(customer_id: str, payment_method_id: str) -> None:
     """Set the customer's default payment method for future charges."""
-    stripe.Customer.modify(customer_id, invoice_settings={"default_payment_method": payment_method_id})
+    try:
+        stripe.Customer.modify(customer_id, invoice_settings={"default_payment_method": payment_method_id})
+    except stripe.error.InvalidRequestError as e:
+        if "attached" in str(e).lower() and "must be" in str(e).lower():
+            # Payment method not attached (can happen with PaymentElement/3DS flow). Attach first.
+            stripe.PaymentMethod.attach(payment_method_id, customer=customer_id)
+            stripe.Customer.modify(customer_id, invoice_settings={"default_payment_method": payment_method_id})
+        else:
+            raise
 
 
 def charge_customer(
