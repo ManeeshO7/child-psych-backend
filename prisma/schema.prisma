@@ -17,6 +17,7 @@ model User {
   lastName       String    @map("last_name")
   phone          String?
   role           String    @default("patient") // "patient" | "doctor"
+  patientProfile PatientProfile?
   emailVerified  DateTime? @map("email_verified")
   tempPasswordExpiresAt DateTime? @map("temp_password_expires_at")
   mustResetPassword Boolean @default(false) @map("must_reset_password")
@@ -35,9 +36,49 @@ model User {
   googleCalendarId     String?   @map("google_calendar_id")
   stripeCustomerId     String?   @unique @map("stripe_customer_id")
   formAssignments PatientFormAssignment[] @relation("PatientFormAssignments")
+  patientDocuments PatientDocument[]
   allowedFollowupTypes Json? @map("allowed_followup_types") // ["followup_med_30", "followup_med_therapy_45"] set by doctor after intake
   rejectedAfterOrientation Boolean? @map("rejected_after_orientation") // true = doctor rejected after orientation; clinical intake hidden
   @@map("users")
+}
+
+// Patient profile info required before orientation (Name, Sex, DOB, SSN, Contact, Pharmacy, Guardians)
+model PatientProfile {
+  id                        String   @id @default(cuid())
+  userId                    String   @unique @map("user_id")
+  user                      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sex                       String?  @map("sex") // "male" | "female" | "other" | "prefer_not_to_say"
+  dateOfBirth               DateTime? @map("date_of_birth")
+  ssn                       String?  @map("ssn") // Last 4 digits or full - consider encryption in production
+  address                   String?  @db.Text
+  preferredPharmacyName     String?  @map("preferred_pharmacy_name")
+  preferredPharmacyPhone    String?  @map("preferred_pharmacy_phone")
+  preferredPharmacyAddress  String?  @map("preferred_pharmacy_address") @db.Text
+  guardian1Name             String?  @map("guardian_1_name")
+  guardian1Relationship     String?  @map("guardian_1_relationship")
+  guardian1Phone            String?  @map("guardian_1_phone")
+  guardian1Address          String?  @map("guardian_1_address") @db.Text
+  guardian2Name             String?  @map("guardian_2_name")
+  guardian2Relationship     String?  @map("guardian_2_relationship")
+  guardian2Phone            String?  @map("guardian_2_phone")
+  guardian2Address          String?  @map("guardian_2_address") @db.Text
+  completedAt               DateTime? @map("completed_at")
+  createdAt                 DateTime @default(now()) @map("created_at")
+  updatedAt                 DateTime @updatedAt @map("updated_at")
+  @@map("patient_profiles")
+}
+
+// Patient-uploaded documents (e.g. previous medical records) stored in GCS
+model PatientDocument {
+  id          String   @id @default(cuid())
+  userId      String   @map("user_id")
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  displayName String   @map("display_name") // e.g. "Previous medical records"
+  fileName    String   @map("file_name")    // Original filename
+  gcsPath     String   @map("gcs_path")     // Path in GCS bucket
+  contentType String   @default("application/pdf") @map("content_type")
+  createdAt   DateTime @default(now()) @map("created_at")
+  @@map("patient_documents")
 }
 
 model PatientRequest {

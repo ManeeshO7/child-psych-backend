@@ -32,7 +32,7 @@ load_dotenv()
 # Appointment type -> (product name, default price cents)
 PRODUCTS = {
     "orientation_consult": ("Orientation consultation (30 min)", 7500),
-    "clinical_intake": ("Clinical Intake Appointment (60 min)", 15000),
+    "clinical_intake": ("Clinical Intake Appointment (75 min)", 15000),
     "followup_med_30": ("Follow-up med management (30 min)", 7500),
     "followup_med_therapy_45": ("Follow-up med + therapy (45 min)", 11250),
 }

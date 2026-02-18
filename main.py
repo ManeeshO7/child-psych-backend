@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import connect_db, disconnect_db
-from app.routers import auth, contact, request_access, patient_requests, intake, appointments, availability, payments, patient_forms
+from app.routers import auth, contact, request_access, patient_requests, intake, appointments, availability, payments, patient_forms, patient_profile, patient_documents
 
 
 @asynccontextmanager
@@ -53,6 +53,8 @@ app.include_router(appointments.router)
 app.include_router(availability.router)
 app.include_router(payments.router)
 app.include_router(patient_forms.router)
+app.include_router(patient_profile.router)
+app.include_router(patient_documents.router)
 
 
 @app.get("/health")

@@ -4,9 +4,32 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.db import get_db
+from app.email_service import send_rejection_email
 from app.healthcare_fhir import create_questionnaire_response
 
 router = APIRouter(prefix="/api/request-access", tags=["request-access"])
+
+# Keys that trigger auto-reject when patient answers "yes"
+AUTO_REJECT_KEYS = [
+    "activeSuicidalThoughts",
+    "psychiatricHospitalization",
+    "psychoticSymptoms",
+    "severeAggression",
+    "legalCustodyCourt",
+    "childProtectiveServices",
+]
+
+AUTO_REJECT_NOTE = "Auto-rejected based on pre-screening questionnaire responses. A provider may override this decision if appropriate."
+
+
+def _should_auto_reject(form_data: dict) -> bool:
+    if not form_data or not isinstance(form_data, dict):
+        return False
+    for key in AUTO_REJECT_KEYS:
+        val = form_data.get(key)
+        if val is not None and str(val).strip().lower() == "yes":
+            return True
+    return False
 
 
 class RequestAccessBody(BaseModel):
@@ -122,6 +145,25 @@ async def submit_questionnaire(body: QuestionnaireBody):
             status_code=503,
             detail="Questionnaire could not be saved at this time. Please try again later.",
         )
+    first_name = getattr(record, "firstName", None) or getattr(record, "first_name", "")
+
+    if _should_auto_reject(body.formData):
+        await db.patientrequest.update(
+            where={"id": record.id},
+            data={
+                "fhirQuestionnaireResponseId": fhir_id,
+                "status": "rejected",
+                "rejectedNote": AUTO_REJECT_NOTE,
+                "reviewedAt": datetime.now(timezone.utc),
+                # reviewedBy left None to indicate auto-reject (doctor can override)
+            },
+        )
+        send_rejection_email(
+            to=record.email,
+            first_name=first_name,
+            rejected_note=AUTO_REJECT_NOTE,
+        )
+        return {"success": True, "autoRejected": True}
     await db.patientrequest.update(
         where={"id": record.id},
         data={"fhirQuestionnaireResponseId": fhir_id},

@@ -9,7 +9,7 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from pydantic import BaseModel
 
 from app.db import get_db
@@ -76,16 +76,35 @@ class PatientOverviewResponse(BaseModel):
 # ========== Doctor Endpoints ==========
 
 @router.get("/patients")
-async def list_all_patients(session: dict = Depends(require_doctor)):
-    """List all patients (users with role=patient) for the doctor dashboard."""
+async def list_all_patients(
+    session: dict = Depends(require_doctor),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Items per page"),
+    search: Optional[str] = Query(None, description="Filter by patient name"),
+):
+    """List patients (users with role=patient) with pagination and optional name search."""
     db = await get_db()
+    where: dict = {"role": "patient"}
+    if search and search.strip():
+        q = search.strip()
+        where = {
+            "role": "patient",
+            "OR": [
+                {"firstName": {"contains": q, "mode": "insensitive"}},
+                {"lastName": {"contains": q, "mode": "insensitive"}},
+            ],
+        }
+    skip = (page - 1) * limit
+    total = await db.user.count(where=where)
     users = await db.user.find_many(
-        where={"role": "patient"},
+        where=where,
         include={
             "appointmentsAsPatient": True,
             "intakeSubmission": True,
         },
         order={"createdAt": "desc"},
+        skip=skip,
+        take=limit,
     )
     result = []
     for u in users:
@@ -104,7 +123,12 @@ async def list_all_patients(session: dict = Depends(require_doctor)):
             "appointmentCount": len(appointments),
             "intakeStatus": intake.status if intake else None,
         })
-    return result
+    return {
+        "patients": result,
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
 
 
 @router.get("/forms")
@@ -185,11 +209,14 @@ async def get_patient_overview(
                 "include": {
                     "form": True,
                     "submission": True,
+                    "appointment": True,
                 },
                 "orderBy": {"assignedAt": "desc"},
             },
             "intakeSubmission": True,
             "patientRequest": True,
+            "patientProfile": True,
+            "patientDocuments": {"orderBy": {"createdAt": "desc"}},
         },
     )
     
@@ -218,6 +245,8 @@ async def get_patient_overview(
         submission = getattr(fa, "submission", None)
         
         fhir_id = getattr(fa, "fhirResponseId", None) or getattr(fa, "fhir_response_id", None)
+        apt = getattr(fa, "appointment", None)
+        apt_id = getattr(fa, "appointmentId", None) or getattr(fa, "appointment_id", None)
         assignment_data = {
             "id": fa.id,
             "formId": fa.formId if hasattr(fa, "formId") else getattr(fa, "form_id", ""),
@@ -228,7 +257,12 @@ async def get_patient_overview(
             "completedAt": getattr(fa, "completedAt", None) or getattr(fa, "completed_at", None),
             "fhirResponseId": fhir_id,
             "uploadedGcsPath": getattr(fa, "uploadedGcsPath", None) or getattr(fa, "uploaded_gcs_path", None),
+            "appointmentId": apt_id,
         }
+        if apt:
+            sched = getattr(apt, "scheduledAt", None) or getattr(apt, "scheduled_at", None)
+            assignment_data["appointmentScheduledAt"] = sched.isoformat() if sched else None
+            assignment_data["appointmentType"] = getattr(apt, "type", None) or "unknown"
         
         # For questionnaire forms: fetch Q&A from FHIR for display (instead of raw response ID)
         if form and form.type == "questionnaire" and fhir_id:
@@ -277,9 +311,33 @@ async def get_patient_overview(
             "createdAt": getattr(patient_request, "createdAt", None) or getattr(patient_request, "created_at", None),
         }
     
-    # Address from pre-screening (childResidenceAddress) or intake if needed
+    # Address from PatientProfile, pre-screening, or intake
     address = None
-    if patient_request_data and patient_request_data.get("questionnaireData"):
+    patient_profile_data = None
+    profile = getattr(patient, "patientProfile", None)
+    if profile:
+        addr = getattr(profile, "address", None)
+        if addr:
+            address = addr
+        patient_profile_data = {
+            "sex": getattr(profile, "sex", None),
+            "dateOfBirth": None,
+            "ssn": getattr(profile, "ssn", None),
+            "address": getattr(profile, "address", None),
+            "preferredPharmacyName": getattr(profile, "preferredPharmacyName", None) or getattr(profile, "preferred_pharmacy_name", None),
+            "preferredPharmacyPhone": getattr(profile, "preferredPharmacyPhone", None) or getattr(profile, "preferred_pharmacy_phone", None),
+            "preferredPharmacyAddress": getattr(profile, "preferredPharmacyAddress", None) or getattr(profile, "preferred_pharmacy_address", None),
+            "guardian1Name": getattr(profile, "guardian1Name", None) or getattr(profile, "guardian_1_name", None),
+            "guardian1Relationship": getattr(profile, "guardian1Relationship", None) or getattr(profile, "guardian_1_relationship", None),
+            "guardian1Phone": getattr(profile, "guardian1Phone", None) or getattr(profile, "guardian_1_phone", None),
+            "guardian2Name": getattr(profile, "guardian2Name", None) or getattr(profile, "guardian_2_name", None),
+            "guardian2Relationship": getattr(profile, "guardian2Relationship", None) or getattr(profile, "guardian_2_relationship", None),
+            "guardian2Phone": getattr(profile, "guardian2Phone", None) or getattr(profile, "guardian_2_phone", None),
+        }
+        dob = getattr(profile, "dateOfBirth", None) or getattr(profile, "date_of_birth", None)
+        if dob:
+            patient_profile_data["dateOfBirth"] = dob.isoformat()[:10] if hasattr(dob, "isoformat") else str(dob)[:10]
+    if not address and patient_request_data and patient_request_data.get("questionnaireData"):
         qdata = patient_request_data["questionnaireData"]
         if isinstance(qdata, dict):
             address = qdata.get("childResidenceAddress") or qdata.get("childLocation") or qdata.get("address")
@@ -287,14 +345,33 @@ async def get_patient_overview(
         form_data = intake_data["formData"]
         if isinstance(form_data, dict):
             address = form_data.get("address") or form_data.get("childResidenceAddress") or form_data.get("childLocation")
-    
+
+    # Serialize patient documents (profile uploads: previous medical records)
+    patient_docs = []
+    for d in getattr(patient, "patientDocuments", []) or []:
+        gcs_path = getattr(d, "gcsPath", None) or getattr(d, "gcs_path", "")
+        if gcs_path:
+            download_url = generate_signed_url(PATIENT_DOCS_BUCKET, gcs_path, expiration_minutes=60)
+        else:
+            download_url = None
+        patient_docs.append({
+            "id": d.id,
+            "displayName": getattr(d, "displayName", None) or getattr(d, "display_name", ""),
+            "fileName": getattr(d, "fileName", None) or getattr(d, "file_name", ""),
+            "contentType": getattr(d, "contentType", None) or getattr(d, "content_type", "application/pdf"),
+            "createdAt": getattr(d, "createdAt", None) or getattr(d, "created_at", None),
+            "downloadUrl": download_url,
+        })
+
     return {
         "patientId": patient.id,
         "patientName": f"{first_name} {last_name}".strip(),
         "patientEmail": patient.email,
         "patientPhone": getattr(patient, "phone", None),
-        "address": address,
+        "address": address or (patient_profile_data and patient_profile_data.get("address")),
+        "patientProfile": patient_profile_data,
         "patientRequest": patient_request_data,
+        "patientDocuments": patient_docs,
         "appointments": appointments,
         "formAssignments": form_assignments,
         "intakeSubmission": intake_data,
@@ -485,15 +562,20 @@ async def upload_pdf_form(
 
 
 @router.get("/check-pending")
-async def check_pending_forms(session: dict = Depends(require_patient)):
-    """Check if patient has pending forms (used before booking)."""
+async def check_pending_forms(
+    appointmentId: str | None = None,
+    session: dict = Depends(require_patient),
+):
+    """Check if patient has pending forms. If appointmentId given, only counts forms for that appointment (or unlinked)."""
     db = await get_db()
-    
-    pending_count = await db.patientformassignment.count(
-        where={
-            "patientId": session["id"],
-            "status": "pending",
-        },
-    )
-    
+    where: dict = {
+        "patientId": session["id"],
+        "status": "pending",
+    }
+    if appointmentId:
+        where["OR"] = [
+            {"appointmentId": appointmentId},
+            {"appointmentId": None},
+        ]
+    pending_count = await db.patientformassignment.count(where=where)
     return {"hasPendingForms": pending_count > 0, "pendingCount": pending_count}

@@ -44,6 +44,8 @@ async def list_requests(session: dict = Depends(require_doctor)):
             from_fhir = get_questionnaire_response_as_form_data(fhir_id)
             questionnaire_data = from_fhir if from_fhir is not None else questionnaire_data
         created_at_val = _get_attr(r, "createdAt", "created_at")
+        reviewed_by = _get_attr(r, "reviewedBy", "reviewed_by")
+        auto_rejected = r.status == "rejected" and not reviewed_by
         out.append({
             "id": r.id,
             "firstName": _get_attr(r, "first_name", "firstName", default=""),
@@ -53,6 +55,7 @@ async def list_requests(session: dict = Depends(require_doctor)):
             "notes": r.notes,
             "status": r.status,
             "rejectedNote": _get_attr(r, "rejected_note", "rejectedNote"),
+            "autoRejected": auto_rejected,
             "createdAt": created_at_val.isoformat() if created_at_val else None,
             "consentAt": consent_at.isoformat() if consent_at else None,
             "questionnaireData": questionnaire_data,
@@ -69,7 +72,8 @@ async def approve(id: str, session: dict = Depends(require_doctor)):
     )
     if not req_record:
         raise HTTPException(status_code=404, detail="Request not found")
-    if req_record.status != "pending":
+    # Allow approve for pending or rejected (doctor can override auto-reject)
+    if req_record.status not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Request already processed")
     existing = await db.user.find_first(
         where={"email": req_record.email.lower(), "role": "patient"},

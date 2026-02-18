@@ -1,6 +1,6 @@
 """
 Doctor availability: blocks define "when I'm available"; doctor then picks which
-slots to offer per duration (30/45/60 min). Patients only see offered (bookable) slots.
+slots to offer per duration (30/45/75 min). Patients only see offered (bookable) slots.
 """
 from datetime import date, datetime, timedelta, time, timezone
 from zoneinfo import ZoneInfo
@@ -16,12 +16,12 @@ from app.dependencies import require_doctor
 PRACTICE_TZ = ZoneInfo("America/Los_Angeles")
 SLOT_MINUTES = 30
 # How far ahead patients can see and doctors can configure availability.
-AVAILABILITY_DAYS_AHEAD = 60
+AVAILABILITY_DAYS_AHEAD = 90  # 3 months
 
 router = APIRouter(prefix="/api/availability", tags=["availability"])
 
 
-ALLOWED_DURATION_OPTIONS = (30, 45, 60)
+ALLOWED_DURATION_OPTIONS = (30, 45, 75)
 
 
 class AvailabilityBlockIn(BaseModel):
@@ -33,7 +33,7 @@ class AvailabilityBlockIn(BaseModel):
 
 class OfferedSlotsIn(BaseModel):
     date: str  # "YYYY-MM-DD"
-    durationMinutes: int  # 30, 45, or 60
+    durationMinutes: int  # 30, 45, or 75
     startTimes: list[str]  # ["09:00", "09:30", ...] (HH:MM, 15-min aligned)
 
 
@@ -212,7 +212,7 @@ async def _candidate_slots_for_date_duration(db, doctor_id: str, day: date, dura
 
 @router.get("/")
 async def list_availability(session: dict = Depends(require_doctor)):
-    """List current doctor availability blocks for the configured window (e.g. next 60 days)."""
+    """List current doctor availability blocks for the configured window (e.g. next 3 months)."""
     db = await get_db()
     start_d, end_d = _get_availability_window()
     blocks = await db.doctoravailability.find_many(
@@ -291,6 +291,50 @@ async def set_availability(
         if b.allowedDurationsMinutes is not None:
             create_data["allowedDurationsMinutes"] = prisma_fields.Json(data=b.allowedDurationsMinutes)
         await db.doctoravailability.create(data=create_data)
+
+    # Auto-save offered slots: for each (date, duration) in the new blocks, set offered = all candidate slots
+    # so patients can book immediately; doctor can later unselect in "Offer slots" and save to remove some.
+    dates_in_body = {_parse_date(b.date) for b in body if start_d <= _parse_date(b.date) <= end_d}
+    for d in dates_in_body:
+        allowed = set()
+        for b in body:
+            if _parse_date(b.date) != d:
+                continue
+            if b.allowedDurationsMinutes:
+                allowed.update(b.allowedDurationsMinutes)
+            else:
+                allowed.update(ALLOWED_DURATION_OPTIONS)
+        for dur in allowed:
+            pairs = await _candidate_slots_for_date_duration(db, session["id"], d, dur)
+            # Dedupe start times (overlapping blocks can yield the same slot twice)
+            start_times = list(dict.fromkeys(_time_to_hhmm(s.time()) for s, _ in pairs))
+            await db.doctorbookableslot.delete_many(
+                where={
+                    "doctorId": session["id"],
+                    "date": {"gte": f"{d.isoformat()}T00:00:00.000Z", "lte": f"{d.isoformat()}T23:59:59.999Z"},
+                    "durationMinutes": dur,
+                },
+            )
+            for st in start_times:
+                await db.doctorbookableslot.create(
+                    data={
+                        "doctor": {"connect": {"id": session["id"]}},
+                        "date": f"{d.isoformat()}T00:00:00.000Z",
+                        "startTime": st.strip(),
+                        "durationMinutes": dur,
+                    },
+                )
+    # Clear offered slots for dates that no longer have any block (doctor removed blocks for those days)
+    all_dates_in_range = {start_d + timedelta(days=i) for i in range((end_d - start_d).days + 1)}
+    dates_to_clear = all_dates_in_range - dates_in_body
+    for d in dates_to_clear:
+        await db.doctorbookableslot.delete_many(
+            where={
+                "doctorId": session["id"],
+                "date": {"gte": f"{d.isoformat()}T00:00:00.000Z", "lte": f"{d.isoformat()}T23:59:59.999Z"},
+            },
+        )
+
     return await list_availability(session)
 
 
@@ -305,7 +349,7 @@ async def get_candidate_slots(
     derived from availability blocks (excluding already-booked). Doctor uses these to choose which to offer.
     """
     if durationMinutes not in ALLOWED_DURATION_OPTIONS:
-        raise HTTPException(status_code=400, detail="durationMinutes must be 30, 45, or 60")
+        raise HTTPException(status_code=400, detail="durationMinutes must be 30, 45, or 75")
     day = _parse_date(date)
     start_d, end_d = _get_availability_window()
     if not (start_d <= day <= end_d):
@@ -327,7 +371,7 @@ async def get_offered_slots(
 ):
     """Return the start times the doctor has already offered for this date and duration."""
     if durationMinutes not in ALLOWED_DURATION_OPTIONS:
-        raise HTTPException(status_code=400, detail="durationMinutes must be 30, 45, or 60")
+        raise HTTPException(status_code=400, detail="durationMinutes must be 30, 45, or 75")
     day = _parse_date(date)
     start_d, end_d = _get_availability_window()
     if not (start_d <= day <= end_d):
@@ -352,7 +396,7 @@ async def set_offered_slots(body: OfferedSlotsIn, session: dict = Depends(requir
     for that (doctor, date, duration). startTimes must be 15-min aligned.
     """
     if body.durationMinutes not in ALLOWED_DURATION_OPTIONS:
-        raise HTTPException(status_code=400, detail="durationMinutes must be 30, 45, or 60")
+        raise HTTPException(status_code=400, detail="durationMinutes must be 30, 45, or 75")
     day = _parse_date(body.date)
     start_d, end_d = _get_availability_window()
     if not (start_d <= day <= end_d):
@@ -400,7 +444,7 @@ async def get_available_slots(
     Return bookable slots for patients. Only slots the doctor has explicitly offered
     for this duration are returned; booked slots are excluded.
 
-    - durationMinutes: 30, 45, or 60. Defaults to SLOT_MINUTES when not provided.
+    - durationMinutes: 30, 45, or 75. Defaults to SLOT_MINUTES when not provided.
     - excludeAppointmentId: when rescheduling, exclude this appointment so its current slot appears available.
     """
     db = await get_db()

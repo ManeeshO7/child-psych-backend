@@ -4,7 +4,7 @@ Uses doctor's stored OAuth refresh token.
 """
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from google.oauth2.credentials import Credentials
@@ -72,6 +72,15 @@ def create_calendar_event_with_meet(
         return (None, None)
     try:
         service = build("calendar", "v3", credentials=creds)
+        # Ensure we send UTC to Google: convert if caller passed Pacific (or other TZ)
+        if start_utc.tzinfo is None:
+            start_utc = start_utc.replace(tzinfo=timezone.utc)
+        else:
+            start_utc = start_utc.astimezone(timezone.utc)
+        if end_utc.tzinfo is None:
+            end_utc = end_utc.replace(tzinfo=timezone.utc)
+        else:
+            end_utc = end_utc.astimezone(timezone.utc)
         start_rfc = start_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         end_rfc = end_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         body = {
@@ -131,6 +140,14 @@ def update_calendar_event(
         return None
     try:
         service = build("calendar", "v3", credentials=creds)
+        if start_utc.tzinfo is None:
+            start_utc = start_utc.replace(tzinfo=timezone.utc)
+        else:
+            start_utc = start_utc.astimezone(timezone.utc)
+        if end_utc.tzinfo is None:
+            end_utc = end_utc.replace(tzinfo=timezone.utc)
+        else:
+            end_utc = end_utc.astimezone(timezone.utc)
         start_rfc = start_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         end_rfc = end_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         body = {

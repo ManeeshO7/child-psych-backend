@@ -30,7 +30,7 @@ async def _clear_doctor_calendar_token_and_raise(db, doctor_id: str):
 # Appointment types and phase gating
 APPOINTMENT_TYPES = {
     "orientation_consult": {"durationMinutes": 30, "label": "Orientation consultation"},
-    "clinical_intake": {"durationMinutes": 60, "label": "Clinical Intake Appointment"},
+    "clinical_intake": {"durationMinutes": 75, "label": "Clinical Intake Appointment"},
     "followup_med_30": {"durationMinutes": 30, "label": "Follow-up (med management, 30 min)"},
     "followup_med_therapy_45": {"durationMinutes": 45, "label": "Follow-up (med + therapy, 45 min)"},
 }
@@ -124,7 +124,7 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
     """
     Return appointment types the current patient is allowed to book, based on phase:
     - New patients: only orientation_consult (30 min).
-    - After orientation + approval + no pending forms: clinical_intake (60 min).
+    - After orientation + approval + no pending forms: clinical_intake (75 min).
     - After clinical intake: followup_med_30 and followup_med_therapy_45.
     """
     db = await get_db()
@@ -142,7 +142,7 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
 
     patient_user = await db.user.find_unique(
         where={"id": patient_id},
-        include={"patientRequest": True},
+        include={"patientRequest": True, "patientProfile": True},
     )
     request_status = None
     if getattr(patient_user, "patientRequest", None):
@@ -170,13 +170,27 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
     )
     has_pending_clinical_intake = pending_clinical is not None
 
+    # Check if patient profile is complete (required before orientation)
+    profile_complete = False
+    profile = getattr(patient_user, "patientProfile", None)
+    if profile:
+        first = (getattr(patient_user, "firstName", None) or getattr(patient_user, "first_name", "") or "").strip()
+        last = (getattr(patient_user, "lastName", None) or getattr(patient_user, "last_name", "") or "").strip()
+        phone = (getattr(patient_user, "phone", None) or "").strip()
+        sex = (getattr(profile, "sex", None) or "").strip()
+        dob = getattr(profile, "dateOfBirth", None) or getattr(profile, "date_of_birth", None)
+        ssn = (getattr(profile, "ssn", None) or "").strip()
+        pharmacy = (getattr(profile, "preferredPharmacyName", None) or getattr(profile, "preferred_pharmacy_name", None) or "").strip()
+        profile_complete = bool(first and last and phone and sex and dob and ssn and pharmacy)
+
     allowed = []
     if not has_orientation:
-        allowed.append({
-            "type": "orientation_consult",
-            "durationMinutes": APPOINTMENT_TYPES["orientation_consult"]["durationMinutes"],
-            "label": APPOINTMENT_TYPES["orientation_consult"]["label"],
-        })
+        if profile_complete:
+            allowed.append({
+                "type": "orientation_consult",
+                "durationMinutes": APPOINTMENT_TYPES["orientation_consult"]["durationMinutes"],
+                "label": APPOINTMENT_TYPES["orientation_consult"]["label"],
+            })
     if (
         has_orientation
         and is_approved
@@ -213,7 +227,10 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
     ]
     not_allowed_reasons = {}
     if "orientation_consult" not in allowed_set:
-        not_allowed_reasons["orientation_consult"] = "You've already completed orientation."
+        if has_orientation:
+            not_allowed_reasons["orientation_consult"] = "You've already completed orientation."
+        elif not profile_complete:
+            not_allowed_reasons["orientation_consult"] = "Complete your profile first (Name, Sex, DOB, SSN, Contact, Pharmacy)."
     if "clinical_intake" not in allowed_set:
         if not has_orientation:
             not_allowed_reasons["clinical_intake"] = "Complete your initial evaluation (orientation) first."
@@ -240,6 +257,7 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
         "allowedTypes": allowed,
         "allTypes": all_types,
         "notAllowedReasons": not_allowed_reasons,
+        "profileComplete": profile_complete,
     }
 
 
@@ -305,6 +323,7 @@ async def list_appointments_paged(
     cursor: str | None = None,
     view: str | None = None,  # "active" | "completed" | None
     date_str: str | None = None,  # YYYY-MM-DD in practice (PST) timezone
+    patient_search: str | None = None,  # Filter by patient name (doctor only)
 ):
     """
     Cursor-based pagination for appointments.
@@ -314,6 +333,7 @@ async def list_appointments_paged(
 
     Pass `cursor=<last_seen_id>` to fetch the next page.
     Optional `date_str=YYYY-MM-DD` filters to appointments on that date (PST).
+    Optional `patient_search` (doctor only) filters by patient first/last name.
     """
     db = await get_db()
     role = session["role"]
@@ -329,6 +349,15 @@ async def list_appointments_paged(
         where = {**where, "status": "completed"}
     elif view == "active":
         where = {**where, "status": {"in": ["scheduled", "card_on_file", "paid", "pending_confirmation"]}}
+
+    if role == "doctor" and patient_search and patient_search.strip():
+        q = patient_search.strip()
+        where["patient"] = {
+            "OR": [
+                {"firstName": {"contains": q, "mode": "insensitive"}},
+                {"lastName": {"contains": q, "mode": "insensitive"}},
+            ],
+        }
 
     if date_str:
         try:
@@ -428,7 +457,7 @@ async def create_appointment(
     if scheduled_at.tzinfo is None:
         scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
     scheduled_at_practice = scheduled_at.astimezone(PRACTICE_TZ)
-    # Require 15-min slot alignment so we can support 30/45/60-minute sessions
+    # Require 15-min slot alignment so we can support 30/45/75-minute sessions
     slot_minutes = scheduled_at_practice.hour * 60 + scheduled_at_practice.minute
     if slot_minutes % 15 != 0 or scheduled_at_practice.second != 0 or scheduled_at_practice.microsecond != 0:
         raise HTTPException(
@@ -460,7 +489,10 @@ async def create_appointment(
     completed_types = {a.type for a in completed}
     has_orientation = "orientation_consult" in completed_types
     has_intake = "clinical_intake" in completed_types or "intake" in completed_types
-    patient_user = await db.user.find_unique(where={"id": session["id"]}, include={"patientRequest": True})
+    patient_user = await db.user.find_unique(
+        where={"id": session["id"]},
+        include={"patientRequest": True, "patientProfile": True},
+    )
     request_status = getattr(patient_user.patientRequest, "status", None) if getattr(patient_user, "patientRequest", None) else None
     is_approved = request_status == "approved"
     pending_forms_count = await db.patientformassignment.count(
@@ -468,8 +500,23 @@ async def create_appointment(
     )
     no_pending_forms = pending_forms_count == 0
 
-    if body.type == "orientation_consult" and has_orientation:
-        raise HTTPException(status_code=403, detail="You have already completed orientation. You can book clinical intake or follow-ups.")
+    if body.type == "orientation_consult":
+        if has_orientation:
+            raise HTTPException(status_code=403, detail="You have already completed orientation. You can book clinical intake or follow-ups.")
+        # Require complete profile before orientation
+        profile = getattr(patient_user, "patientProfile", None)
+        first = (getattr(patient_user, "firstName", None) or getattr(patient_user, "first_name", "") or "").strip()
+        last = (getattr(patient_user, "lastName", None) or getattr(patient_user, "last_name", "") or "").strip()
+        phone = (getattr(patient_user, "phone", None) or "").strip()
+        sex = (getattr(profile, "sex", None) or "").strip() if profile else ""
+        dob = getattr(profile, "dateOfBirth", None) or getattr(profile, "date_of_birth", None) if profile else None
+        ssn = (getattr(profile, "ssn", None) or "").strip() if profile else ""
+        pharmacy = (getattr(profile, "preferredPharmacyName", None) or getattr(profile, "preferred_pharmacy_name", None) or "").strip() if profile else ""
+        if not (first and last and phone and sex and dob and ssn and pharmacy):
+            raise HTTPException(
+                status_code=403,
+                detail="Complete your profile first (Name, Sex, DOB, SSN, Contact info, Preferred Pharmacy) before booking orientation.",
+            )
     if body.type == "clinical_intake":
         if not has_orientation:
             raise HTTPException(status_code=403, detail="Complete an orientation consultation first.")
@@ -722,8 +769,8 @@ async def schedule_for_patient(body: ScheduleForPatientBody, session: dict = Dep
         raise HTTPException(status_code=404, detail="Patient not found")
 
     if body.type == "clinical_intake":
-        if body.durationMinutes != 60:
-            raise HTTPException(status_code=400, detail="Clinical intake must be 60 minutes")
+        if body.durationMinutes != 75:
+            raise HTTPException(status_code=400, detail="Clinical intake must be 75 minutes")
         completed = await db.appointment.find_many(
             where={
                 "patientId": body.patientId,
@@ -1243,12 +1290,47 @@ async def charge_appointment(id: str, session: dict = Depends(require_doctor)):
             price_id=price_id,
         )
     except stripe.error.CardError as e:
+        patient_email = getattr(patient, "email", None)
+        patient_name = f"{getattr(patient, 'firstName', None) or getattr(patient, 'first_name', '')} {getattr(patient, 'lastName', None) or getattr(patient, 'last_name', '')}".strip()
+        if patient_email:
+            try:
+                from app.email_service import send_card_update_request
+                send_card_update_request(to_email=patient_email, patient_name=patient_name)
+            except Exception:
+                pass
         raise HTTPException(status_code=400, detail=e.user_message or "Card charge failed")
     await db.appointment.update(
         where={"id": id},
         data={"status": "paid"},
     )
     return {"ok": True, "status": "paid", "message": "Payment successful. Receipt sent by Stripe."}
+
+
+@router.post("/{id}/request-card-update")
+async def request_card_update(id: str, session: dict = Depends(require_doctor)):
+    """Email the patient to update their card (doctor only)."""
+    db = await get_db()
+    appointment = await db.appointment.find_unique(
+        where={"id": id},
+        include={"patient": True, "doctor": True},
+    )
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    doctor_id = getattr(appointment, "doctorId", None) or getattr(appointment, "doctor_id", None)
+    if doctor_id != session["id"]:
+        raise HTTPException(status_code=403, detail="Not your appointment")
+    patient = appointment.patient
+    if not patient:
+        raise HTTPException(status_code=400, detail="Patient not found")
+    patient_email = getattr(patient, "email", None)
+    if not patient_email:
+        raise HTTPException(status_code=400, detail="Patient has no email on file")
+    patient_name = f"{getattr(patient, 'firstName', None) or getattr(patient, 'first_name', '')} {getattr(patient, 'lastName', None) or getattr(patient, 'last_name', '')}".strip()
+    from app.email_service import send_card_update_request
+    ok, err = send_card_update_request(to_email=patient_email, patient_name=patient_name)
+    if not ok:
+        raise HTTPException(status_code=500, detail=err or "Failed to send email")
+    return {"ok": True, "message": "Email sent"}
 
 
 @router.post("/{id}/complete")
@@ -1305,20 +1387,22 @@ async def confirm_by_patient(id: str, session: dict = Depends(require_patient)):
             status_code=400,
             detail="Save your card first before confirming.",
         )
-    # For clinical intake, patient must complete assigned forms before confirming
-    apt_type = getattr(appointment, "type", None) or ""
-    if apt_type == "clinical_intake":
-        pending_forms = await db.patientformassignment.count(
-            where={
-                "patientId": patient_id,
-                "status": "pending",
-            },
+    # Patient must complete forms assigned to this appointment before confirming
+    pending_forms = await db.patientformassignment.count(
+        where={
+            "patientId": patient_id,
+            "status": "pending",
+            "OR": [
+                {"appointmentId": id},
+                {"appointmentId": None},
+            ],
+        },
+    )
+    if pending_forms > 0:
+        raise HTTPException(
+            status_code=403,
+            detail="Complete your assigned forms before confirming. Visit Forms & Documents to complete them.",
         )
-        if pending_forms > 0:
-            raise HTTPException(
-                status_code=403,
-                detail="Complete your assigned forms before confirming. Visit Forms & Documents to complete them.",
-            )
 
     # Create Google Meet link (when doctor has Calendar connected)
     meet_link = None

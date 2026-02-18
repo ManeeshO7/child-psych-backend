@@ -252,15 +252,8 @@ def send_appointment_confirmation_email(
         if dt_utc.tzinfo is None:
             dt_utc = dt_utc.replace(tzinfo=ZoneInfo("UTC"))
         dt_pacific = dt_utc.astimezone(PRACTICE_TZ)
-        
-        # Get timezone abbreviation (PST or PDT)
-        tz_abbr = dt_pacific.strftime("%Z")
-        if not tz_abbr or tz_abbr == dt_pacific.strftime("%z"):
-            # Fallback if %Z doesn't work
-            tz_abbr = "PT"
-        
-        # Show in a readable form (e.g. "Jan 30, 2025 at 10:00 AM PST")
-        date_str = dt_pacific.strftime("%b %d, %Y at %I:%M %p") + f" {tz_abbr}"
+        # Use PST in emails to match app labels (UI says "Pacific Time (PST)" everywhere)
+        date_str = dt_pacific.strftime("%b %d, %Y at %I:%M %p") + " PST"
     except Exception:
         date_str = scheduled_at_iso
     meet_section = ""
@@ -314,12 +307,7 @@ def send_appointment_rescheduled_email(
         if dt_utc.tzinfo is None:
             dt_utc = dt_utc.replace(tzinfo=ZoneInfo("UTC"))
         dt_pacific = dt_utc.astimezone(PRACTICE_TZ)
-
-        tz_abbr = dt_pacific.strftime("%Z")
-        if not tz_abbr or tz_abbr == dt_pacific.strftime("%z"):
-            tz_abbr = "PT"
-
-        date_str = dt_pacific.strftime("%b %d, %Y at %I:%M %p") + f" {tz_abbr}"
+        date_str = dt_pacific.strftime("%b %d, %Y at %I:%M %p") + " PST"
     except Exception:
         date_str = scheduled_at_iso
 
@@ -355,6 +343,29 @@ def send_appointment_rescheduled_email(
         body_html=body,
     )
     return _send_email(to, "TelePsych — Appointment rescheduled", html)
+
+
+def send_card_update_request(to_email: str, patient_name: str) -> tuple[bool, Optional[str]]:
+    """Send email asking the patient to update their payment method after a charge failure."""
+    app_url = (os.environ.get("FRONTEND_ORIGIN") or os.environ.get("APP_URL") or "http://localhost:3100").strip().rstrip("/")
+    save_card_link = f"{app_url}/patient/save-card"
+    first_name = (patient_name or "there").split()[0] if patient_name else "there"
+    body = f"""
+<p>Hello {first_name},</p>
+<p>We tried to charge your card for your recent visit, but the charge was declined.</p>
+<p>Please update your payment method using the link below so we can complete your payment.</p>
+{_button(save_card_link, "Update payment method")}
+<div style="margin-top:10px;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+  <div style="font-weight:700;margin-bottom:6px;">Or copy this link</div>
+  <div style="word-break:break-all;"><a href="{save_card_link}" style="color:#7A5C3B;">{save_card_link}</a></div>
+</div>
+<p style="margin-top:16px;">Best regards,<br/>TelePsych</p>
+"""
+    html = _wrap_email_html(
+        heading="Action needed: update your payment method",
+        body_html=body,
+    )
+    return _send_email(to_email, "Action needed: update your payment method", html)
 
 
 def send_password_reset_email(
