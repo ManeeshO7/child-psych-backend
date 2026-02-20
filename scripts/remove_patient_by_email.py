@@ -14,7 +14,6 @@ Deletes (in order):
   - FHIR QuestionnaireResponse for each PatientRequest (pre-screening)
   - FHIR QuestionnaireResponse for each PatientFormAssignment (assigned forms)
   - Appointments where the patient is this user
-  - IntakeSubmission for this user
   - PatientRequest(s) with this email (and clears user link if approved)
   - User (patient) with this email
 """
@@ -81,11 +80,6 @@ async def main() -> None:
                 where={"patientId": user_id},
             )
             print(f"  Deleted {deleted_appts} appointment(s).")
-            # Delete intake submission
-            intake = await db.intakesubmission.find_unique(where={"userId": user_id})
-            if intake:
-                await db.intakesubmission.delete(where={"id": intake.id})
-                print("  Deleted intake submission.")
             # Unlink patient request from user
             await db.patientrequest.update_many(
                 where={"userId": user_id},

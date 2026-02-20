@@ -70,7 +70,6 @@ class PatientOverviewResponse(BaseModel):
     patientEmail: str
     appointments: list[dict]
     formAssignments: list[dict]
-    intakeSubmission: Optional[dict] = None
 
 
 # ========== Doctor Endpoints ==========
@@ -100,7 +99,6 @@ async def list_all_patients(
         where=where,
         include={
             "appointmentsAsPatient": True,
-            "intakeSubmission": True,
         },
         order={"createdAt": "desc"},
         skip=skip,
@@ -111,7 +109,6 @@ async def list_all_patients(
         first_name = getattr(u, "firstName", None) or getattr(u, "first_name", "")
         last_name = getattr(u, "lastName", None) or getattr(u, "last_name", "")
         name = f"{first_name} {last_name}".strip() or "—"
-        intake = getattr(u, "intakeSubmission", None)
         appointments = getattr(u, "appointmentsAsPatient", []) or []
         result.append({
             "id": u.id,
@@ -121,7 +118,6 @@ async def list_all_patients(
             "lastName": last_name,
             "phone": getattr(u, "phone", None),
             "appointmentCount": len(appointments),
-            "intakeStatus": intake.status if intake else None,
         })
     return {
         "patients": result,
@@ -213,7 +209,6 @@ async def get_patient_overview(
                 },
                 "orderBy": {"assignedAt": "desc"},
             },
-            "intakeSubmission": True,
             "patientRequest": True,
             "patientProfile": True,
             "patientDocuments": {"orderBy": {"createdAt": "desc"}},
@@ -341,10 +336,6 @@ async def get_patient_overview(
         qdata = patient_request_data["questionnaireData"]
         if isinstance(qdata, dict):
             address = qdata.get("childResidenceAddress") or qdata.get("childLocation") or qdata.get("address")
-    if not address and intake_data and intake_data.get("formData"):
-        form_data = intake_data["formData"]
-        if isinstance(form_data, dict):
-            address = form_data.get("address") or form_data.get("childResidenceAddress") or form_data.get("childLocation")
 
     # Serialize patient documents (profile uploads: previous medical records)
     patient_docs = []

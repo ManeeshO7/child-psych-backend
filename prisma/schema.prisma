@@ -27,7 +27,6 @@ model User {
   updatedAt      DateTime  @updatedAt @map("updated_at")
 
   patientRequest   PatientRequest?
-  intakeSubmission IntakeSubmission?
   appointmentsAsPatient Appointment[] @relation("PatientAppointments")
   appointmentsAsDoctor   Appointment[] @relation("DoctorAppointments")
   availabilityBlocks    DoctorAvailability[]
@@ -100,19 +99,6 @@ model PatientRequest {
   userId String? @unique @map("user_id")
   user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
   @@map("patient_requests")
-}
-
-model IntakeSubmission {
-  id          String   @id @default(cuid())
-  userId      String   @unique @map("user_id")
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  formData    Json     @map("form_data")
-  status      String   @default("draft") // "draft" | "submitted" | "reviewed"
-  reviewedAt  DateTime? @map("reviewed_at")
-  reviewedBy  String?  @map("reviewed_by")
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
-  @@map("intake_submissions")
 }
 
 model DoctorAvailability {

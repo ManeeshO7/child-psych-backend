@@ -52,6 +52,7 @@ def _serialize_appointment(
     patient_has_assigned_forms=None,
     patient_has_pending_clinical_intake=None,
     patient_has_scheduled_followup=None,
+    has_forms_for_this_appointment=None,
 ):
     scheduled_at = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at", None)
     duration = getattr(a, "duration_minutes", None) or getattr(a, "durationMinutes", 60)
@@ -85,6 +86,8 @@ def _serialize_appointment(
         out["patientHasPendingClinicalIntake"] = patient_has_pending_clinical_intake
     if patient_has_scheduled_followup is not None:
         out["patientHasScheduledFollowup"] = patient_has_scheduled_followup
+    if has_forms_for_this_appointment is not None:
+        out["hasFormsForThisAppointment"] = has_forms_for_this_appointment
     return out
 
 
@@ -140,6 +143,16 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
     has_orientation = "orientation_consult" in completed_types
     has_intake = "clinical_intake" in completed_types or "intake" in completed_types
 
+    # Already has an orientation (scheduled, paid, or completed) — don't show "Book orientation" again
+    existing_orientation = await db.appointment.find_first(
+        where={
+            "patientId": patient_id,
+            "type": "orientation_consult",
+            "status": {"not": "cancelled"},
+        },
+    )
+    has_any_orientation_appointment = existing_orientation is not None
+
     patient_user = await db.user.find_unique(
         where={"id": patient_id},
         include={"patientRequest": True, "patientProfile": True},
@@ -184,13 +197,12 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
         profile_complete = bool(first and last and phone and sex and dob and ssn and pharmacy)
 
     allowed = []
-    if not has_orientation:
-        if profile_complete:
-            allowed.append({
-                "type": "orientation_consult",
-                "durationMinutes": APPOINTMENT_TYPES["orientation_consult"]["durationMinutes"],
-                "label": APPOINTMENT_TYPES["orientation_consult"]["label"],
-            })
+    if not has_any_orientation_appointment and profile_complete:
+        allowed.append({
+            "type": "orientation_consult",
+            "durationMinutes": APPOINTMENT_TYPES["orientation_consult"]["durationMinutes"],
+            "label": APPOINTMENT_TYPES["orientation_consult"]["label"],
+        })
     if (
         has_orientation
         and is_approved
@@ -227,8 +239,8 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
     ]
     not_allowed_reasons = {}
     if "orientation_consult" not in allowed_set:
-        if has_orientation:
-            not_allowed_reasons["orientation_consult"] = "You've already completed orientation."
+        if has_any_orientation_appointment:
+            not_allowed_reasons["orientation_consult"] = "You already have an orientation appointment (scheduled or completed)."
         elif not profile_complete:
             not_allowed_reasons["orientation_consult"] = "Complete your profile first (Name, Sex, DOB, SSN, Contact, Pharmacy)."
     if "clinical_intake" not in allowed_set:
@@ -401,6 +413,7 @@ async def list_appointments_paged(
         has_forms = None
         has_clinical = None
         has_scheduled_followup = None
+        has_forms_for_this = None
         if getattr(a, "patient", None):
             patient_id = a.patient.id
             if a.type == "orientation_consult":
@@ -428,6 +441,13 @@ async def list_appointments_paged(
                         },
                     )
                 ) > 0
+            # For clinical_intake / followup: true if any forms are assigned to this appointment
+            if a.type in ("clinical_intake", "followup_med_30", "followup_med_therapy_45"):
+                has_forms_for_this = (
+                    await db.patientformassignment.count(
+                        where={"appointmentId": a.id},
+                    )
+                ) > 0
         items.append(
             _serialize_appointment(
                 a,
@@ -435,6 +455,7 @@ async def list_appointments_paged(
                 patient_has_assigned_forms=has_forms,
                 patient_has_pending_clinical_intake=has_clinical,
                 patient_has_scheduled_followup=has_scheduled_followup,
+                has_forms_for_this_appointment=has_forms_for_this,
             )
         )
     return {
