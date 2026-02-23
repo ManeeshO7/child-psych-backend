@@ -41,3 +41,6 @@ eggs
 *-service-account*.json
 gmtelepsych-gcp-service-account-key.json
 child-psych-services-serviceaccountkey.json
+
+# Cloud SQL Auth Proxy (downloaded binary)
+cloud-sql-proxy

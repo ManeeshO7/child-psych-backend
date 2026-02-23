@@ -53,10 +53,13 @@ def _serialize_appointment(
     patient_has_pending_clinical_intake=None,
     patient_has_scheduled_followup=None,
     has_forms_for_this_appointment=None,
+    has_pending_forms_for_this_appointment=None,
+    forms_assigned_count=None,
 ):
     scheduled_at = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at", None)
     duration = getattr(a, "duration_minutes", None) or getattr(a, "durationMinutes", 60)
     meet_link = getattr(a, "meetLink", None) or getattr(a, "meet_link", None)
+    require_forms = getattr(a, "requireFormsBeforeConfirm", None) or getattr(a, "require_forms_before_confirm", True)
     out = {
         "id": a.id,
         "scheduledAt": scheduled_at.isoformat() if scheduled_at else None,
@@ -65,6 +68,7 @@ def _serialize_appointment(
         "type": a.type,
         "notes": a.notes,
         "meetLink": meet_link,
+        "requireFormsBeforeConfirm": require_forms,
     }
     if include_patient and getattr(a, "patient", None):
         p = a.patient
@@ -88,6 +92,10 @@ def _serialize_appointment(
         out["patientHasScheduledFollowup"] = patient_has_scheduled_followup
     if has_forms_for_this_appointment is not None:
         out["hasFormsForThisAppointment"] = has_forms_for_this_appointment
+    if has_pending_forms_for_this_appointment is not None:
+        out["hasPendingFormsForThisAppointment"] = has_pending_forms_for_this_appointment
+    if forms_assigned_count is not None:
+        out["formsAssignedCount"] = forms_assigned_count
     return out
 
 
@@ -112,6 +120,7 @@ class ScheduleForPatientBody(BaseModel):
     scheduledAt: str  # ISO datetime
     durationMinutes: int  # 30, 45, or 60 (for clinical_intake)
     type: str  # followup_med_30 | followup_med_therapy_45 | clinical_intake
+    requireFormsBeforeConfirm: bool = True  # If True, patient must complete assigned forms before confirming
 
 
 class RejectAfterOrientationBody(BaseModel):
@@ -316,7 +325,29 @@ async def list_appointments(
             skip=skip,
             include={"doctor": True},
         )
-        return [_serialize_appointment(a, include_doctor=True) for a in appointments]
+        patient_id = session["id"]
+        result = []
+        for a in appointments:
+            pending_for_this = (
+                await db.patientformassignment.count(
+                    where={
+                        "patientId": patient_id,
+                        "status": "pending",
+                        "OR": [
+                            {"appointmentId": a.id},
+                            {"appointmentId": None},
+                        ],
+                    },
+                )
+            ) > 0
+            result.append(
+                _serialize_appointment(
+                    a,
+                    include_doctor=True,
+                    has_pending_forms_for_this_appointment=pending_for_this,
+                )
+            )
+        return result
     else:
         appointments = await db.appointment.find_many(
             where={"doctorId": session["id"]},
@@ -401,8 +432,31 @@ async def list_appointments_paged(
     next_cursor = page[-1].id if (has_more and len(page) > 0) else None
 
     if role == "patient":
+        # Per-appointment: block confirm until forms assigned to this appointment (or unlinked) are completed
+        patient_id = session["id"]
+        items = []
+        for a in page:
+            pending_for_this = (
+                await db.patientformassignment.count(
+                    where={
+                        "patientId": patient_id,
+                        "status": "pending",
+                        "OR": [
+                            {"appointmentId": a.id},
+                            {"appointmentId": None},
+                        ],
+                    },
+                )
+            ) > 0
+            items.append(
+                _serialize_appointment(
+                    a,
+                    include_doctor=True,
+                    has_pending_forms_for_this_appointment=pending_for_this,
+                )
+            )
         return {
-            "items": [_serialize_appointment(a, include_doctor=True) for a in page],
+            "items": items,
             "nextCursor": next_cursor,
             "hasMore": has_more,
         }
@@ -414,6 +468,7 @@ async def list_appointments_paged(
         has_clinical = None
         has_scheduled_followup = None
         has_forms_for_this = None
+        forms_count = None
         if getattr(a, "patient", None):
             patient_id = a.patient.id
             if a.type == "orientation_consult":
@@ -422,16 +477,22 @@ async def list_appointments_paged(
                         where={"patientId": patient_id},
                     )
                 ) > 0
+                # True if patient has any clinical_intake (scheduled or already completed) — hide "Schedule clinical intake"
                 has_clinical = (
                     await db.appointment.count(
                         where={
                             "patientId": patient_id,
                             "type": "clinical_intake",
-                            "status": {"in": ["pending_confirmation", "scheduled", "card_on_file", "paid"]},
+                            "status": {"in": ["pending_confirmation", "scheduled", "card_on_file", "paid", "completed"]},
                         },
                     )
                 ) > 0
-            if a.type in ("orientation_consult", "clinical_intake", "intake") and a.status == "completed":
+            if a.status == "completed" and a.type in (
+                "orientation_consult", "clinical_intake", "intake",
+                "followup_med_30", "followup_med_therapy_45",
+            ):
+                # True only if patient has an *upcoming* follow-up (scheduled/paid, not yet completed) — hide "Schedule follow-up".
+                # Exclude "completed" so after a follow-up is done, doctor can schedule the next one.
                 has_scheduled_followup = (
                     await db.appointment.count(
                         where={
@@ -441,13 +502,12 @@ async def list_appointments_paged(
                         },
                     )
                 ) > 0
-            # For clinical_intake / followup: true if any forms are assigned to this appointment
+            # For clinical_intake / followup: count forms assigned to this appointment
             if a.type in ("clinical_intake", "followup_med_30", "followup_med_therapy_45"):
-                has_forms_for_this = (
-                    await db.patientformassignment.count(
-                        where={"appointmentId": a.id},
-                    )
-                ) > 0
+                forms_count = await db.patientformassignment.count(
+                    where={"appointmentId": a.id},
+                )
+                has_forms_for_this = forms_count > 0
         items.append(
             _serialize_appointment(
                 a,
@@ -456,6 +516,7 @@ async def list_appointments_paged(
                 patient_has_pending_clinical_intake=has_clinical,
                 patient_has_scheduled_followup=has_scheduled_followup,
                 has_forms_for_this_appointment=has_forms_for_this,
+                forms_assigned_count=forms_count if a.type in ("clinical_intake", "followup_med_30", "followup_med_therapy_45") else None,
             )
         )
     return {
@@ -855,6 +916,7 @@ async def schedule_for_patient(body: ScheduleForPatientBody, session: dict = Dep
             "durationMinutes": body.durationMinutes,
             "type": body.type,
             "status": "pending_confirmation",
+            "requireFormsBeforeConfirm": body.requireFormsBeforeConfirm,
         },
     )
     return {"ok": True, "appointment": _serialize_appointment(apt, include_patient=True)}
@@ -907,7 +969,29 @@ async def update_appointment(
     if body.status is not None:
         data["status"] = body.status
     if body.notes is not None:
-        data["notes"] = body.notes
+        # Only doctors can add or edit encounter notes; store in FHIR (HIPAA) then DB
+        if role == "doctor":
+            from app.healthcare_fhir import (
+                create_encounter_with_note,
+                update_encounter_note,
+            )
+            fhir_enc_id = getattr(appointment, "fhirEncounterId", None) or getattr(appointment, "fhir_encounter_id", None)
+            scheduled_at = getattr(appointment, "scheduledAt", None) or getattr(appointment, "scheduled_at", None)
+            scheduled_iso = scheduled_at.isoformat() if scheduled_at else ""
+            if fhir_enc_id:
+                update_encounter_note(fhir_enc_id, body.notes)
+            else:
+                new_fhir_id = create_encounter_with_note(
+                    appointment_id=id,
+                    patient_id=patient_id,
+                    doctor_id=doctor_id,
+                    scheduled_at_iso=scheduled_iso,
+                    note_text=body.notes,
+                )
+                if new_fhir_id:
+                    data["fhirEncounterId"] = new_fhir_id
+            data["notes"] = body.notes
+        # Patients cannot set or change notes
 
     # When cancelling, delete the Google Calendar event if we have it
     if body.status == "cancelled":
@@ -1408,22 +1492,24 @@ async def confirm_by_patient(id: str, session: dict = Depends(require_patient)):
             status_code=400,
             detail="Save your card first before confirming.",
         )
-    # Patient must complete forms assigned to this appointment before confirming
-    pending_forms = await db.patientformassignment.count(
-        where={
-            "patientId": patient_id,
-            "status": "pending",
-            "OR": [
-                {"appointmentId": id},
-                {"appointmentId": None},
-            ],
-        },
-    )
-    if pending_forms > 0:
-        raise HTTPException(
-            status_code=403,
-            detail="Complete your assigned forms before confirming. Visit Forms & Documents to complete them.",
+    # Patient must complete forms assigned to this appointment before confirming (only when doctor required it)
+    require_forms = getattr(appointment, "requireFormsBeforeConfirm", None) or getattr(appointment, "require_forms_before_confirm", True)
+    if require_forms:
+        pending_forms = await db.patientformassignment.count(
+            where={
+                "patientId": patient_id,
+                "status": "pending",
+                "OR": [
+                    {"appointmentId": id},
+                    {"appointmentId": None},
+                ],
+            },
         )
+        if pending_forms > 0:
+            raise HTTPException(
+                status_code=403,
+                detail="Complete your assigned forms before confirming. Visit Forms & Documents to complete them.",
+            )
 
     # Create Google Meet link (when doctor has Calendar connected)
     meet_link = None

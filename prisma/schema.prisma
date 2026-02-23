@@ -4,6 +4,11 @@ generator client {
   recursive_type_depth = 5
 }
 
+// JS client for Prisma Studio; run `prisma generate` with .venv activated so both clients generate
+generator studio_client {
+  provider = "prisma-client-js"
+}
+
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
@@ -139,6 +144,8 @@ model Appointment {
   notes          String?  @db.Text
   meetLink       String?  @map("meet_link")
   googleCalendarEventId String? @map("google_calendar_event_id") // For update/delete on reschedule or cancel
+  fhirEncounterId String? @map("fhir_encounter_id") // FHIR Encounter for HIPAA-compliant encounter notes
+  requireFormsBeforeConfirm Boolean @default(true) @map("require_forms_before_confirm") // If true, patient must complete assigned forms before confirming
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
   

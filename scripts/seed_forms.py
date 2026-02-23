@@ -39,10 +39,16 @@ FORMS_TO_SEED = [
         "templateGcsPath": "forms/templates/Design_Flow.pdf",
     },
     {
-        "title": "Follow-up Assessment Questionnaire",
-        "description": "Complete this questionnaire about your current symptoms and progress.",
+        "title": "Pediatric Symptom Checklist (PSC-17)",
+        "description": "Screening for emotional, attention, and behavior difficulties. Options: Never, Sometimes, Often.",
         "type": "questionnaire",
-        "questionnaireKey": "followup_assessment",
+        "questionnaireKey": "psc17",
+    },
+    {
+        "title": "PHQ-A (Adolescent Depression Questionnaire)",
+        "description": "Over the last 2 weeks, how often have you been bothered by the following problems? Options: Not at all, Several days, More than half the days, Nearly every day.",
+        "type": "questionnaire",
+        "questionnaireKey": "phqa",
     },
     {
         "title": "Medication Review",

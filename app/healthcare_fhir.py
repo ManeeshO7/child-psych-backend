@@ -211,3 +211,189 @@ def delete_questionnaire_response(resource_id: str) -> bool:
     except Exception as e:
         logger.warning("FHIR delete failed for %s: %s", resource_id, e)
     return False
+
+
+# --- Encounter (appointment notes) for HIPAA-compliant storage ---
+
+def _fhir_encounter_parent(config: dict) -> str:
+    return (
+        f"projects/{config['project_id']}/locations/{config['location']}"
+        f"/datasets/{config['dataset_id']}/fhirStores/{config['fhir_store_id']}"
+    )
+
+
+def create_encounter_with_note(
+    appointment_id: str,
+    patient_id: str,
+    doctor_id: str,
+    scheduled_at_iso: str,
+    note_text: str,
+) -> str | None:
+    """
+    Create a FHIR R4 Encounter with encounter note (Annotation) for HIPAA-compliant storage.
+    Returns the Encounter resource ID, or None if FHIR is not configured or creation fails.
+    """
+    config = _fhir_config()
+    if not config:
+        return None
+    if not note_text or not note_text.strip():
+        return None
+    try:
+        from googleapiclient.errors import HttpError as GoogleHttpError
+        from googleapiclient import discovery
+
+        client = discovery.build("healthcare", "v1")
+        parent = _fhir_encounter_parent(config)
+        # Period: use scheduled time as start; end = start + 1 hour for display
+        start = scheduled_at_iso
+        end = scheduled_at_iso
+        try:
+            from datetime import timedelta
+            iso = scheduled_at_iso.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            end_dt = dt + timedelta(hours=1)
+            end = end_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        except Exception:
+            pass
+
+        body = {
+            "resourceType": "Encounter",
+            "status": "finished",
+            "class": {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                "code": "AMB",
+                "display": "ambulatory",
+            },
+            "identifier": [
+                {"system": "urn:telepsych:appointment", "value": appointment_id},
+            ],
+            "subject": {
+                "identifier": {"system": "urn:telepsych:patient", "value": patient_id},
+            },
+            "participant": [
+                {
+                    "type": [
+                        {
+                            "coding": [
+                                {
+                                    "system": "http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+                                    "code": "PPRF",
+                                    "display": "primary performer",
+                                }
+                            ]
+                        }
+                    ],
+                    "individual": {
+                        "identifier": {"system": "urn:telepsych:practitioner", "value": doctor_id},
+                    },
+                }
+            ],
+            "period": {"start": start, "end": end},
+            "note": [{"text": note_text.strip()}],
+        }
+        request = (
+            client.projects()
+            .locations()
+            .datasets()
+            .fhirStores()
+            .fhir()
+            .create(parent=parent, type="Encounter", body=body)
+        )
+        request.headers["content-type"] = "application/fhir+json;charset=utf-8"
+        response = request.execute()
+        resource_id = response.get("id")
+        if resource_id:
+            logger.info("Created FHIR Encounter %s for appointment %s", resource_id, appointment_id)
+            return resource_id
+    except GoogleHttpError as e:
+        try:
+            err_content = e.content.decode("utf-8") if isinstance(e.content, bytes) else str(e.content)
+            logger.warning("FHIR Encounter create error body: %s", err_content)
+        except Exception:
+            pass
+        logger.exception("FHIR Encounter create failed: %s", e)
+    except Exception as e:
+        logger.exception("FHIR Encounter create failed: %s", e)
+    return None
+
+
+def update_encounter_note(fhir_encounter_id: str, note_text: str) -> bool:
+    """
+    Update the note on an existing FHIR Encounter. Returns True on success.
+    """
+    config = _fhir_config()
+    if not config or not fhir_encounter_id:
+        return False
+    try:
+        from googleapiclient.errors import HttpError as GoogleHttpError
+        from googleapiclient import discovery
+
+        client = discovery.build("healthcare", "v1")
+        name = (
+            f"{_fhir_encounter_parent(config)}/fhir/Encounter/{fhir_encounter_id}"
+        )
+        request = (
+            client.projects()
+            .locations()
+            .datasets()
+            .fhirStores()
+            .fhir()
+            .read(name=name)
+        )
+        body = request.execute()
+        body["note"] = [{"text": (note_text or "").strip()}]
+        update_request = (
+            client.projects()
+            .locations()
+            .datasets()
+            .fhirStores()
+            .fhir()
+            .update(name=name, body=body)
+        )
+        update_request.headers["content-type"] = "application/fhir+json;charset=utf-8"
+        update_request.execute()
+        logger.info("Updated FHIR Encounter note %s", fhir_encounter_id)
+        return True
+    except GoogleHttpError as e:
+        logger.warning("FHIR Encounter update failed for %s: %s", fhir_encounter_id, e)
+    except Exception as e:
+        logger.warning("FHIR Encounter update failed for %s: %s", fhir_encounter_id, e)
+    return False
+
+
+def get_encounter_note(fhir_encounter_id: str) -> str | None:
+    """
+    Read the encounter note text from a FHIR Encounter. Returns None if not found or not configured.
+    """
+    config = _fhir_config()
+    if not config or not fhir_encounter_id:
+        return None
+    try:
+        from googleapiclient.errors import HttpError as GoogleHttpError
+        from googleapiclient import discovery
+
+        client = discovery.build("healthcare", "v1")
+        name = (
+            f"{_fhir_encounter_parent(config)}/fhir/Encounter/{fhir_encounter_id}"
+        )
+        request = (
+            client.projects()
+            .locations()
+            .datasets()
+            .fhirStores()
+            .fhir()
+            .read(name=name)
+        )
+        body = request.execute()
+        notes = body.get("note") or []
+        if notes and isinstance(notes[0], dict):
+            return notes[0].get("text") or None
+        return None
+    except GoogleHttpError as e:
+        if e.resp and e.resp.status == 404:
+            logger.info("FHIR Encounter %s not found", fhir_encounter_id)
+        else:
+            logger.warning("FHIR Encounter read failed for %s: %s", fhir_encounter_id, e)
+    except Exception as e:
+        logger.warning("FHIR Encounter read failed for %s: %s", fhir_encounter_id, e)
+    return None

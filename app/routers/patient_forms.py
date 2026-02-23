@@ -247,6 +247,7 @@ async def get_patient_overview(
             "formId": fa.formId if hasattr(fa, "formId") else getattr(fa, "form_id", ""),
             "formTitle": form.title if form else "Unknown",
             "formType": form.type if form else "unknown",
+            "formQuestionnaireKey": getattr(form, "questionnaireKey", None) or getattr(form, "questionnaire_key", None) if form else None,
             "status": fa.status,
             "assignedAt": getattr(fa, "assignedAt", None) or getattr(fa, "assigned_at", None),
             "completedAt": getattr(fa, "completedAt", None) or getattr(fa, "completed_at", None),

@@ -385,3 +385,43 @@ async def request_doctor_password_reset(body: RequestPasswordResetBody):
         import logging
         logging.getLogger(__name__).warning("Doctor password reset email failed: %s", err)
     return {"success": True}
+
+
+@router.post("/request-password-reset")
+async def request_patient_password_reset(body: RequestPasswordResetBody):
+    """
+    Patient: request a new password-setup or password-reset link (e.g. after the 24h approval link expired).
+    Always returns success to avoid leaking whether an email exists.
+    """
+    email = (body.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+    db = await get_db()
+    user = await db.user.find_first(where={"email": email, "role": "patient"})
+    if not user:
+        return {"success": True}
+
+    from datetime import datetime, timezone, timedelta
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+    reset_token = generate_reset_token()
+    await db.user.update(
+        where={"id": user.id},
+        data={
+            "passwordResetToken": reset_token,
+            "passwordResetTokenExpiresAt": expires_at,
+            "mustResetPassword": True,
+        },
+    )
+
+    first = getattr(user, "first_name", None) or getattr(user, "firstName", "") or ""
+    ok, err = send_password_reset_email(
+        to=user.email,
+        first_name=first,
+        reset_token=reset_token,
+        portal="patient",
+        expires_hours=24,
+    )
+    if not ok:
+        import logging
+        logging.getLogger(__name__).warning("Patient password reset email failed: %s", err)
+    return {"success": True}

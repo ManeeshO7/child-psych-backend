@@ -125,30 +125,42 @@ def _send_email(to: str, subject: str, html: str) -> tuple[bool, Optional[str]]:
 
 def send_acceptance_message_email(to: str, first_name: str) -> tuple[bool, Optional[str]]:
     """Send the practice acceptance message (good fit, next steps). Sent when doctor approves."""
-    html = f"""
-    <p>Dear Parent or Guardian,</p>
-    <p>Thank you for completing the pre-screening questionnaire. Based on the information
+    # Styled box for next steps (warm cream, matches site palette)
+    next_steps_box = """
+    <div style="margin:18px 0;padding:18px 20px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+      <div style="font-weight:700;font-size:15px;margin-bottom:10px;color:#1F2937;">Next steps</div>
+      <ol style="margin:0;padding-left:20px;line-height:1.8;">
+        <li>Log in to the patient portal with the email and password provided in a separate message.</li>
+        <li>Complete your basic profile information in the portal.</li>
+        <li>From the <strong>Appointments</strong> tab, book a 30-minute orientation consult.</li>
+      </ol>
+    </div>
+    """
+    note_box = """
+    <div style="margin:18px 0;padding:14px 16px;border:1px solid #E6DDCF;border-radius:10px;background:#FAFAF9;font-size:13px;color:#4B5563;">
+      A physician–patient relationship is established only after your profile is completed and the orientation appointment has occurred.
+    </div>
+    """
+    body = f"""
+    <p style="margin:0 0 14px 0;">Dear Parent or Guardian,</p>
+    <p style="margin:0 0 14px 0;">Thank you for completing the pre-screening questionnaire. Based on the information
     provided, your child appears to be an appropriate fit for the scope of services offered by
     our practice.</p>
-    <p>Our practice provides integrated outpatient psychiatric care for children,
+    <p style="margin:0 0 14px 0;">Our practice provides integrated outpatient psychiatric care for children,
     adolescents, and young adults ages 5 through 25, including medication management,
     psychotherapy, and parent support, delivered exclusively via telehealth.</p>
-    <p>The next steps include:</p>
-    <ul>
-        <li>Completion of required intake and consent documents</li>
-        <li>Review of practice policies and fee structure</li>
-        <li>Scheduling of the initial evaluation appointment</li>
-    </ul>
-    <p>Please note that a physician–patient relationship is established only after all
-    documentation is completed and the initial appointment has occurred.</p>
-    <p>If you would like to proceed, we will send you a secure link with onboarding and
-    scheduling instructions.</p>
-    <p>Sincerely,<br/>
-    Child Psychiatry Services<br/>
-    Madhuri Medaramelta, MD<br/>
-    Child &amp; Adolescent Psychiatry<br/>
-    Telehealth Practice</p>
+    {next_steps_box}
+    {note_box}
+    <p style="margin:0 0 14px 0;">You will receive a <strong>separate email</strong> with your login credentials and a link to set your password.</p>
+    <p style="margin:18px 0 0 0;">
+      Sincerely,<br/>
+      Child Psychiatry Services<br/>
+      Madhuri Medaramelta, MD<br/>
+      Child &amp; Adolescent Psychiatry<br/>
+      Telehealth Practice
+    </p>
     """
+    html = _wrap_email_html(heading="Your inquiry — next steps", body_html=body)
     return _send_email(to, "Your inquiry — next steps", html)
 
 
@@ -211,7 +223,7 @@ def send_approval_email(
     app_url = (os.environ.get("APP_URL") or "").strip()
     if not app_url:
         _LOG.warning("APP_URL not set; reset link in approval email may be broken")
-    reset_link = f"{app_url or 'https://example.com'}/reset-password?token={quote(reset_token)}"
+    reset_link = f"{app_url or 'https://example.com'}/reset-password?token={quote(reset_token)}&setup=1"
     body = f"""
 <p>Hello {first_name},</p>
 <p>Your request for access to TelePsych has been approved.</p>
