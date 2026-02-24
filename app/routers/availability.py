@@ -146,6 +146,56 @@ def _time_to_hhmm(t: time) -> str:
     return t.strftime("%H:%M")
 
 
+def _candidate_slots_in_memory(
+    blocks_for_day: list,
+    appointments: list,
+    day: date,
+    duration_minutes: int,
+) -> list[tuple[datetime, datetime]]:
+    """Compute candidate (start_dt, end_dt) for `day` and `duration_minutes` from in-memory blocks and appointments."""
+    step_minutes = 15
+    existing_intervals: list[tuple[datetime, datetime]] = []
+    for a in appointments:
+        s = getattr(a, "scheduledAt", None) or getattr(a, "scheduled_at")
+        if not s:
+            continue
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=timezone.utc).astimezone(PRACTICE_TZ)
+        else:
+            s = s.astimezone(PRACTICE_TZ)
+        if s.date() != day:
+            continue
+        dur = getattr(a, "durationMinutes", None) or getattr(a, "duration_minutes", SLOT_MINUTES)
+        existing_intervals.append((s, s + timedelta(minutes=dur)))
+
+    def overlaps_any(start: datetime, end: datetime) -> bool:
+        for a_start, a_end in existing_intervals:
+            if start < a_end and a_start < end:
+                return True
+        return False
+
+    now = datetime.now(PRACTICE_TZ)
+    out: list[tuple[datetime, datetime]] = []
+    for b in blocks_for_day:
+        allowed = getattr(b, "allowedDurationsMinutes", None) if hasattr(b, "allowedDurationsMinutes") else (b.get("allowedDurationsMinutes") if isinstance(b, dict) else None)
+        if allowed is not None:
+            if not isinstance(allowed, list):
+                allowed = list(allowed) if allowed else []
+            if allowed and duration_minutes not in allowed:
+                continue
+        start_t = _parse_time(b.startTime if hasattr(b, "startTime") else b["startTime"])
+        end_t = _parse_time(b.endTime if hasattr(b, "endTime") else b["endTime"])
+        block_start_dt = datetime.combine(day, start_t, tzinfo=PRACTICE_TZ)
+        block_end_dt = datetime.combine(day, end_t, tzinfo=PRACTICE_TZ)
+        t = block_start_dt
+        while t + timedelta(minutes=duration_minutes) <= block_end_dt:
+            end_dt = t + timedelta(minutes=duration_minutes)
+            if t >= now and not overlaps_any(t, end_dt):
+                out.append((t, end_dt))
+            t += timedelta(minutes=step_minutes)
+    return out
+
+
 async def _candidate_slots_for_date_duration(db, doctor_id: str, day: date, duration_minutes: int):
     """Yield (start_dt, end_dt) for each possible slot on `day` with `duration_minutes` from blocks, excluding booked."""
     step_minutes = 15
@@ -271,69 +321,69 @@ async def set_availability(
                         status_code=400,
                         detail=f"allowedDurationsMinutes must only contain {ALLOWED_DURATION_OPTIONS}",
                     )
-    # Delete existing blocks in range, then create new ones (Prisma expects full ISO-8601 DateTime)
+    # Delete existing blocks in range, then create new ones in one batch (Prisma expects full ISO-8601 DateTime).
     await db.doctoravailability.delete_many(
         where={
             "doctorId": session["id"],
             "date": _date_range_iso(start_d, end_d),
         },
     )
+    availability_to_create: list[dict] = []
     for b in body:
         d = _parse_date(b.date)
         if not (start_d <= d <= end_d):
             continue
-        create_data: dict = {
+        row: dict = {
             "doctorId": session["id"],
             "date": f"{d.isoformat()}T00:00:00.000Z",
             "startTime": b.startTime.strip(),
             "endTime": b.endTime.strip(),
         }
         if b.allowedDurationsMinutes is not None:
-            create_data["allowedDurationsMinutes"] = prisma_fields.Json(data=b.allowedDurationsMinutes)
-        await db.doctoravailability.create(data=create_data)
+            row["allowedDurationsMinutes"] = prisma_fields.Json(data=b.allowedDurationsMinutes)
+        availability_to_create.append(row)
+    if availability_to_create:
+        await db.doctoravailability.create_many(data=availability_to_create)
 
-    # Auto-save offered slots: for each (date, duration) in the new blocks, set offered = all candidate slots
-    # so patients can book immediately; doctor can later unselect in "Offer slots" and save to remove some.
+    # Auto-save offered slots: set offered = all candidate slots for dates in body (one delete, one appointments load, one create_many).
     dates_in_body = {_parse_date(b.date) for b in body if start_d <= _parse_date(b.date) <= end_d}
+    window_start = datetime.combine(start_d, time(0, 0), tzinfo=PRACTICE_TZ)
+    window_end = datetime.combine(end_d, time(23, 59), tzinfo=PRACTICE_TZ)
+    appointments = await db.appointment.find_many(
+        where={
+            "doctorId": session["id"],
+            "status": {"not": "cancelled"},
+            "scheduledAt": {"gte": window_start, "lte": window_end},
+        },
+    )
+    await db.doctorbookableslot.delete_many(
+        where={
+            "doctorId": session["id"],
+            "date": _date_range_iso(start_d, end_d),
+        },
+    )
+    slots_to_create: list[dict] = []
     for d in dates_in_body:
+        blocks_for_day = [b for b in body if _parse_date(b.date) == d]
         allowed = set()
-        for b in body:
-            if _parse_date(b.date) != d:
-                continue
+        for b in blocks_for_day:
             if b.allowedDurationsMinutes:
                 allowed.update(b.allowedDurationsMinutes)
             else:
                 allowed.update(ALLOWED_DURATION_OPTIONS)
         for dur in allowed:
-            pairs = await _candidate_slots_for_date_duration(db, session["id"], d, dur)
-            # Dedupe start times (overlapping blocks can yield the same slot twice)
+            pairs = _candidate_slots_in_memory(blocks_for_day, appointments, d, dur)
             start_times = list(dict.fromkeys(_time_to_hhmm(s.time()) for s, _ in pairs))
-            await db.doctorbookableslot.delete_many(
-                where={
-                    "doctorId": session["id"],
-                    "date": {"gte": f"{d.isoformat()}T00:00:00.000Z", "lte": f"{d.isoformat()}T23:59:59.999Z"},
-                    "durationMinutes": dur,
-                },
-            )
+            date_iso = f"{d.isoformat()}T00:00:00.000Z"
             for st in start_times:
-                await db.doctorbookableslot.create(
-                    data={
-                        "doctor": {"connect": {"id": session["id"]}},
-                        "date": f"{d.isoformat()}T00:00:00.000Z",
-                        "startTime": st.strip(),
-                        "durationMinutes": dur,
-                    },
-                )
-    # Clear offered slots for dates that no longer have any block (doctor removed blocks for those days)
-    all_dates_in_range = {start_d + timedelta(days=i) for i in range((end_d - start_d).days + 1)}
-    dates_to_clear = all_dates_in_range - dates_in_body
-    for d in dates_to_clear:
-        await db.doctorbookableslot.delete_many(
-            where={
-                "doctorId": session["id"],
-                "date": {"gte": f"{d.isoformat()}T00:00:00.000Z", "lte": f"{d.isoformat()}T23:59:59.999Z"},
-            },
-        )
+                slots_to_create.append({
+                    "doctorId": session["id"],
+                    "date": date_iso,
+                    "startTime": st.strip(),
+                    "durationMinutes": dur,
+                })
+    if slots_to_create:
+        await db.doctorbookableslot.create_many(data=slots_to_create)
 
     return await list_availability(session)
 
