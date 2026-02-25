@@ -224,6 +224,7 @@ async def get_patient_overview(
     # Serialize appointments
     appointments = []
     for apt in getattr(patient, "appointmentsAsPatient", []):
+        duration = getattr(apt, "durationMinutes", None) or getattr(apt, "duration_minutes", 30)
         appointments.append({
             "id": apt.id,
             "scheduledAt": getattr(apt, "scheduledAt", None) or getattr(apt, "scheduled_at", None),
@@ -231,6 +232,7 @@ async def get_patient_overview(
             "type": apt.type,
             "notes": apt.notes,
             "meetLink": getattr(apt, "meetLink", None) or getattr(apt, "meet_link", None),
+            "durationMinutes": int(duration) if duration is not None else 30,
         })
     
     # Serialize form assignments
