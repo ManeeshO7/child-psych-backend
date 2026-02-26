@@ -8,7 +8,7 @@ Google Cloud Storage service for patient form PDFs.
 import logging
 import os
 from datetime import timedelta
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,27 @@ def upload_patient_document(
     except Exception as e:
         logger.error(f"Failed to upload {blob_name} to {bucket_name}: {e}")
         return None
+
+
+def download_patient_document(bucket_name: str, blob_name: str) -> Tuple[Optional[bytes], Optional[str]]:
+    """
+    Download a blob from GCS and return content + content type.
+
+    Returns:
+        (bytes, content_type) on success, (None, None) on failure
+    """
+    client = _get_gcs_client()
+    if not client:
+        return None, None
+
+    try:
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        content = blob.download_as_bytes()
+        return content, blob.content_type or "application/octet-stream"
+    except Exception as e:
+        logger.error(f"Failed to download {blob_name} from {bucket_name}: {e}")
+        return None, None
 
 
 def delete_blob(bucket_name: str, blob_name: str) -> bool:

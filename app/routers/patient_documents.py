@@ -6,17 +6,24 @@ import logging
 import os
 import uuid
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 
 from app.db import get_db
-from app.dependencies import require_patient
-from app.gcs_service import generate_signed_url, upload_patient_document
+from app.dependencies import require_patient, require_patient_or_doctor
+from app.gcs_service import (
+    delete_blob,
+    download_patient_document,
+    generate_signed_url,
+    upload_patient_document,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/patient-documents", tags=["patient-documents"])
 
 PATIENT_DOCS_BUCKET = os.environ.get("GCS_PATIENT_DOCS_BUCKET", "telepsych-patient-documents")
+USE_SIGNED_URLS_FOR_PATIENT_DOCS = os.environ.get("USE_SIGNED_URLS_FOR_PATIENT_DOCS", "false").strip().lower() in {"1", "true", "yes", "on"}
+PATIENT_DOC_SIGNED_URL_TTL_MINUTES = int(os.environ.get("PATIENT_DOC_SIGNED_URL_TTL_MINUTES", "10"))
 
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp"}
 ALLOWED_CONTENT_TYPES = {
@@ -39,6 +46,7 @@ def _content_type_for_ext(ext: str) -> str:
     return m.get(ext, "application/octet-stream")
 
 
+@router.get("")
 @router.get("/")
 async def list_my_documents(session: dict = Depends(require_patient)):
     """List all documents uploaded by the current patient."""
@@ -49,20 +57,55 @@ async def list_my_documents(session: dict = Depends(require_patient)):
     )
     result = []
     for d in docs:
-        download_url = generate_signed_url(
-            PATIENT_DOCS_BUCKET,
-            d.gcsPath if hasattr(d, "gcsPath") else getattr(d, "gcs_path", ""),
-            expiration_minutes=60,
-        )
+        gcs_path = d.gcsPath if hasattr(d, "gcsPath") else getattr(d, "gcs_path", "")
+        download_url = None
+        if USE_SIGNED_URLS_FOR_PATIENT_DOCS and gcs_path:
+            download_url = generate_signed_url(
+                PATIENT_DOCS_BUCKET,
+                gcs_path,
+                expiration_minutes=PATIENT_DOC_SIGNED_URL_TTL_MINUTES,
+            )
+        fallback_url = f"/api/patient-documents/{d.id}/download" if gcs_path else None
         result.append({
             "id": d.id,
             "displayName": getattr(d, "displayName", None) or getattr(d, "display_name", ""),
             "fileName": getattr(d, "fileName", None) or getattr(d, "file_name", ""),
             "contentType": getattr(d, "contentType", None) or getattr(d, "content_type", "application/pdf"),
             "createdAt": getattr(d, "createdAt", None) or getattr(d, "created_at"),
-            "downloadUrl": download_url,
+            "downloadUrl": download_url or fallback_url,
         })
     return {"documents": result}
+
+
+@router.get("/{document_id}/download")
+async def download_document(
+    document_id: str,
+    session: dict = Depends(require_patient_or_doctor),
+):
+    """Download a patient profile document via backend (fallback when signed URLs are unavailable)."""
+    db = await get_db()
+    doc = await db.patientdocument.find_unique(where={"id": document_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    owner_id = getattr(doc, "userId", None) or getattr(doc, "user_id", None)
+    if session.get("role") == "patient" and owner_id != session["id"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    gcs_path = getattr(doc, "gcsPath", None) or getattr(doc, "gcs_path", None)
+    if not gcs_path:
+        raise HTTPException(status_code=404, detail="Document file not found")
+
+    content, content_type = download_patient_document(PATIENT_DOCS_BUCKET, gcs_path)
+    if content is None:
+        raise HTTPException(status_code=500, detail="Failed to download document")
+
+    file_name = (getattr(doc, "fileName", None) or getattr(doc, "file_name", None) or f"{document_id}.pdf").replace('"', "")
+    headers = {
+        "Content-Disposition": f'inline; filename="{file_name}"',
+        "Cache-Control": "private, max-age=60",
+    }
+    return Response(content=content, media_type=content_type or "application/octet-stream", headers=headers)
 
 
 @router.post("/upload")
@@ -119,3 +162,29 @@ async def upload_document(
         "fileName": getattr(doc, "fileName", None) or getattr(doc, "file_name", ""),
         "createdAt": getattr(doc, "createdAt", None) or getattr(doc, "created_at"),
     }
+
+
+@router.delete("/{document_id}")
+async def delete_document(
+    document_id: str,
+    session: dict = Depends(require_patient),
+):
+    """Delete a patient-uploaded profile document from both GCS and database."""
+    db = await get_db()
+    doc = await db.patientdocument.find_unique(where={"id": document_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    owner_id = getattr(doc, "userId", None) or getattr(doc, "user_id", None)
+    if owner_id != session["id"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    gcs_path = getattr(doc, "gcsPath", None) or getattr(doc, "gcs_path", None)
+    if gcs_path:
+        deleted = delete_blob(PATIENT_DOCS_BUCKET, gcs_path)
+        if not deleted:
+            # Avoid deleting DB row if storage deletion failed; keeps state consistent.
+            raise HTTPException(status_code=500, detail="Failed to delete file from storage")
+
+    await db.patientdocument.delete(where={"id": document_id})
+    return {"ok": True, "deletedId": document_id}

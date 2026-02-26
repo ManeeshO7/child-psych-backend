@@ -28,6 +28,8 @@ router = APIRouter(prefix="/api/patient-forms", tags=["patient-forms"])
 # GCS bucket names (from env or defaults)
 TEMPLATES_BUCKET = os.environ.get("GCS_TEMPLATES_BUCKET", "telepsych-forms-templates")
 PATIENT_DOCS_BUCKET = os.environ.get("GCS_PATIENT_DOCS_BUCKET", "telepsych-patient-documents")
+USE_SIGNED_URLS_FOR_PATIENT_DOCS = os.environ.get("USE_SIGNED_URLS_FOR_PATIENT_DOCS", "false").strip().lower() in {"1", "true", "yes", "on"}
+PATIENT_DOC_SIGNED_URL_TTL_MINUTES = int(os.environ.get("PATIENT_DOC_SIGNED_URL_TTL_MINUTES", "10"))
 
 
 # ========== Pydantic Models ==========
@@ -270,11 +272,13 @@ async def get_patient_overview(
         
         # Add download URL for PDF uploads
         if form and form.type == "pdf_upload" and assignment_data["uploadedGcsPath"]:
-            signed_url = generate_signed_url(
-                PATIENT_DOCS_BUCKET,
-                assignment_data["uploadedGcsPath"],
-                expiration_minutes=60,
-            )
+            signed_url = None
+            if USE_SIGNED_URLS_FOR_PATIENT_DOCS:
+                signed_url = generate_signed_url(
+                    PATIENT_DOCS_BUCKET,
+                    assignment_data["uploadedGcsPath"],
+                    expiration_minutes=PATIENT_DOC_SIGNED_URL_TTL_MINUTES,
+                )
             assignment_data["downloadUrl"] = signed_url
         
         form_assignments.append(assignment_data)
@@ -344,17 +348,21 @@ async def get_patient_overview(
     patient_docs = []
     for d in getattr(patient, "patientDocuments", []) or []:
         gcs_path = getattr(d, "gcsPath", None) or getattr(d, "gcs_path", "")
-        if gcs_path:
-            download_url = generate_signed_url(PATIENT_DOCS_BUCKET, gcs_path, expiration_minutes=60)
-        else:
-            download_url = None
+        download_url = None
+        if gcs_path and USE_SIGNED_URLS_FOR_PATIENT_DOCS:
+            download_url = generate_signed_url(
+                PATIENT_DOCS_BUCKET,
+                gcs_path,
+                expiration_minutes=PATIENT_DOC_SIGNED_URL_TTL_MINUTES,
+            )
+        fallback_url = f"/api/patient-documents/{d.id}/download" if gcs_path else None
         patient_docs.append({
             "id": d.id,
             "displayName": getattr(d, "displayName", None) or getattr(d, "display_name", ""),
             "fileName": getattr(d, "fileName", None) or getattr(d, "file_name", ""),
             "contentType": getattr(d, "contentType", None) or getattr(d, "content_type", "application/pdf"),
             "createdAt": getattr(d, "createdAt", None) or getattr(d, "created_at", None),
-            "downloadUrl": download_url,
+            "downloadUrl": download_url or fallback_url,
         })
 
     return {
