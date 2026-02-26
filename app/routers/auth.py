@@ -6,6 +6,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
 from app.auth import (
+    SESSION_MAX_AGE,
     create_session_payload,
     generate_reset_token,
     hash_password,
@@ -18,7 +19,6 @@ from app.email_service import send_password_reset_email
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 SESSION_COOKIE = "telepsych_session"
-SESSION_MAX_AGE = 60 * 60 * 24 * 7
 
 
 def _is_production() -> bool:

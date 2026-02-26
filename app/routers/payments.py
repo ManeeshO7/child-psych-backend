@@ -2,6 +2,7 @@
 Payments: save card on file (SetupIntent) and confirm. Charge is in appointments router.
 """
 import os
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -272,3 +273,97 @@ async def get_visit_pricing():
             "formatted": f"${amount_cents / 100:.2f}",
         }
     return {"pricing": pricing}
+
+
+@router.get("/history")
+async def get_payment_history(
+    limit: int = 5,
+    session: dict = Depends(require_patient),
+):
+    """
+    Return recent payment history for the logged-in patient.
+    Includes links to Stripe-hosted receipt/invoice when available.
+    """
+    if not _stripe_configured():
+        raise HTTPException(status_code=503, detail="Payments are not configured (STRIPE_SECRET_KEY)")
+
+    import stripe
+
+    db = await get_db()
+    patient = await db.user.find_unique(where={"id": session["id"]})
+    if not patient:
+        raise HTTPException(status_code=400, detail="Patient not found")
+
+    stripe_id = _get_attr(patient, "stripeCustomerId", "stripe_customer_id")
+    if not stripe_id:
+        return {"items": []}
+
+    capped_limit = max(1, min(limit, 20))
+    try:
+        intents = stripe.PaymentIntent.list(customer=stripe_id, limit=capped_limit)
+    except Exception:
+        return {"items": []}
+
+    items: list[dict] = []
+    for pi in getattr(intents, "data", []) or []:
+        # Payment history should represent actual paid charges.
+        if getattr(pi, "status", None) != "succeeded":
+            continue
+
+        charge = None
+        receipt_url = None
+        invoice_pdf_url = None
+        hosted_invoice_url = None
+
+        latest_charge_id = getattr(pi, "latest_charge", None)
+        if latest_charge_id:
+            try:
+                charge = stripe.Charge.retrieve(latest_charge_id)
+                receipt_url = getattr(charge, "receipt_url", None)
+            except Exception:
+                charge = None
+
+        invoice_id = (
+            getattr(charge, "invoice", None) if charge else None
+        ) or getattr(pi, "invoice", None)
+        if invoice_id:
+            try:
+                invoice = stripe.Invoice.retrieve(invoice_id)
+                invoice_pdf_url = getattr(invoice, "invoice_pdf", None)
+                hosted_invoice_url = getattr(invoice, "hosted_invoice_url", None)
+            except Exception:
+                pass
+
+        amount_cents = (
+            getattr(pi, "amount_received", None)
+            or getattr(pi, "amount", None)
+            or (getattr(charge, "amount", None) if charge else None)
+            or 0
+        )
+        currency = (
+            getattr(pi, "currency", None)
+            or (getattr(charge, "currency", None) if charge else None)
+            or "usd"
+        )
+        created_epoch = (
+            getattr(pi, "created", None)
+            or (getattr(charge, "created", None) if charge else None)
+            or 0
+        )
+        created_at = datetime.fromtimestamp(created_epoch, tz=timezone.utc).isoformat() if created_epoch else None
+
+        items.append(
+            {
+                "id": getattr(pi, "id", None),
+                "status": getattr(pi, "status", None),
+                "amountCents": amount_cents,
+                "currency": str(currency).upper(),
+                "createdAt": created_at,
+                "description": getattr(pi, "description", None) or (getattr(charge, "description", None) if charge else None),
+                "receiptUrl": receipt_url,
+                "invoicePdfUrl": invoice_pdf_url,
+                "hostedInvoiceUrl": hosted_invoice_url,
+            }
+        )
+
+    return {"items": items}

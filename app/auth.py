@@ -14,7 +14,8 @@ from argon2.exceptions import VerifyMismatchError
 _argon2_hasher = PasswordHasher()
 
 SESSION_COOKIE = "telepsych_session"
-SESSION_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+SESSION_MAX_AGE = 60 * 30  # 30 minutes (sliding with activity refresh)
+SESSION_IDLE_TIMEOUT = 60 * 30  # 30 minutes inactivity
 
 _LOG = logging.getLogger(__name__)
 
@@ -85,13 +86,25 @@ def _decode_session_token(token: Optional[str]) -> Optional[dict]:
         user_id = payload.get("userId")
         role = payload.get("role")
         exp = payload.get("exp")
-        if exp and (__import__("time").time() > exp):
+        now = __import__("time").time()
+        if exp and (now > exp):
+            return None
+        last_activity_at = payload.get("lat")
+        if last_activity_at is None:
+            last_activity_at = payload.get("iat")
+        if last_activity_at and ((now - float(last_activity_at)) > SESSION_IDLE_TIMEOUT):
             return None
         if role not in ("doctor", "patient"):
             return None
         if not user_id:
             return None
-        return {"id": user_id, "role": role}
+        return {
+            "id": user_id,
+            "role": role,
+            "exp": exp,
+            "iat": payload.get("iat"),
+            "lat": payload.get("lat"),
+        }
     except Exception:
         return None
 
@@ -128,10 +141,19 @@ def get_session_from_bearer(authorization: Optional[str]) -> Optional[dict]:
     return _decode_session_token(token)
 
 
-def create_session_payload(user_id: str, role: str) -> str:
+def create_session_payload(
+    user_id: str,
+    role: str,
+    issued_at: Optional[int] = None,
+    expires_at: Optional[int] = None,
+    last_activity_at: Optional[int] = None,
+) -> str:
     import time
-    exp = int(time.time()) + SESSION_MAX_AGE
-    payload = {"userId": user_id, "role": role, "exp": exp}
+    now = int(time.time())
+    iat = int(issued_at) if issued_at else now
+    exp = int(expires_at) if expires_at else (iat + SESSION_MAX_AGE)
+    lat = int(last_activity_at) if last_activity_at else now
+    payload = {"userId": user_id, "role": role, "iat": iat, "exp": exp, "lat": lat}
     return _encode_session_token(payload)
 
 

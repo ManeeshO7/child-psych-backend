@@ -65,6 +65,11 @@ async def get_my_profile(session: dict = Depends(require_patient)):
         return {
             "profile": None,
             "isComplete": False,
+            "lastUpdatedAt": (
+                getattr(user, "updatedAt", None) or getattr(user, "updated_at", None)
+            ).isoformat()
+            if (getattr(user, "updatedAt", None) or getattr(user, "updated_at", None))
+            else None,
             "user": {
                 "firstName": getattr(user, "firstName", None) or getattr(user, "first_name", ""),
                 "lastName": getattr(user, "lastName", None) or getattr(user, "last_name", ""),
@@ -92,6 +97,15 @@ async def get_my_profile(session: dict = Depends(require_patient)):
             "parentAddress": getattr(profile, "parentAddress", None) or getattr(profile, "parent_address", None),
         },
         "isComplete": _profile_is_complete(user, profile),
+        "lastUpdatedAt": (
+            getattr(profile, "updatedAt", None) or getattr(profile, "updated_at", None)
+        ).isoformat()
+        if (getattr(profile, "updatedAt", None) or getattr(profile, "updated_at", None))
+        else (
+            (getattr(user, "updatedAt", None) or getattr(user, "updated_at", None)).isoformat()
+            if (getattr(user, "updatedAt", None) or getattr(user, "updated_at", None))
+            else None
+        ),
         "user": {
             "firstName": getattr(user, "firstName", None) or getattr(user, "first_name", ""),
             "lastName": getattr(user, "lastName", None) or getattr(user, "last_name", ""),

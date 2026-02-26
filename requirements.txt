@@ -8,6 +8,7 @@ prisma==0.11.0
 
 # Auth
 argon2-cffi>=23.1.0
+cryptography
 
 # Email
 resend==2.5.1

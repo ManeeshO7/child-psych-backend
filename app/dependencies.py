@@ -1,8 +1,15 @@
 from typing import Annotated, Optional
 
-from fastapi import Cookie, Depends, Header
+import time
 
-from app.auth import get_session_from_bearer, get_session_from_cookie
+from fastapi import Cookie, Depends, Header, Response
+
+from app.auth import (
+    SESSION_MAX_AGE,
+    create_session_payload,
+    get_session_from_bearer,
+    get_session_from_cookie,
+)
 from app.db import get_db
 
 SessionUser = dict  # {"id": str, "email": str, "role": str, ...}
@@ -11,6 +18,7 @@ SessionUser = dict  # {"id": str, "email": str, "role": str, ...}
 async def get_session(
     cookie: Annotated[Optional[str], Cookie(alias="telepsych_session")] = None,
     authorization: Annotated[Optional[str], Header()] = None,
+    response: Response = None,
 ) -> Optional[SessionUser]:
     partial = get_session_from_cookie(cookie) or get_session_from_bearer(authorization)
     if not partial:
@@ -23,12 +31,28 @@ async def get_session(
         return None
     first = getattr(user, "first_name", None) or getattr(user, "firstName", "")
     last = getattr(user, "last_name", None) or getattr(user, "lastName", "")
+    now = int(time.time())
+    last_activity = int(partial.get("lat") or partial.get("iat") or now)
+    # Sliding idle timeout: refresh session activity timestamp at most once per minute.
+    if response is not None and (now - last_activity) >= 60:
+        refreshed_token = create_session_payload(
+            user_id=user.id,
+            role=user.role,
+            issued_at=int(partial.get("iat") or now),
+            expires_at=now + SESSION_MAX_AGE,
+            last_activity_at=now,
+        )
+        response.headers["X-Session-Token"] = refreshed_token
+
     return {
         "id": user.id,
         "email": user.email,
         "role": user.role,
         "firstName": first,
         "lastName": last,
+        "iat": partial.get("iat"),
+        "exp": partial.get("exp"),
+        "lat": partial.get("lat"),
     }
 
 
