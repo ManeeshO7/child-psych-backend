@@ -76,28 +76,6 @@ async def main() -> None:
                 if fhir_id and delete_questionnaire_response(fhir_id):
                     print(f"  Deleted FHIR QuestionnaireResponse {fhir_id} (form assignment).")
 
-            # Delete chats (messages + threads) involving this user
-            threads = await db.messagethread.find_many(
-                where={
-                    "OR": [
-                        {"patientId": user_id},
-                        {"doctorId": user_id},
-                    ]
-                }
-            )
-            thread_ids = [t.id for t in threads]
-            if thread_ids:
-                deleted_msgs = await db.message.delete_many(
-                    where={"threadId": {"in": thread_ids}}
-                )
-                print(f"  Deleted {deleted_msgs} message(s).")
-                deleted_threads = await db.messagethread.delete_many(
-                    where={"id": {"in": thread_ids}}
-                )
-                print(f"  Deleted {deleted_threads} message thread(s).")
-            else:
-                print("  No message threads found for this user.")
-
             # Delete appointments
             deleted_appts = await db.appointment.delete_many(
                 where={"patientId": user_id},

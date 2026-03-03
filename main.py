@@ -16,14 +16,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import connect_db, disconnect_db
-from app.message_crypto import validate_message_encryption_config
-from app.routers import auth, contact, request_access, patient_requests, appointments, availability, payments, patient_forms, patient_profile, patient_documents, messages
+from app.routers import auth, contact, request_access, patient_requests, appointments, availability, payments, patient_forms, patient_profile, patient_documents
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Fail fast in production if encryption key is missing.
-    validate_message_encryption_config()
     await connect_db()
     try:
         yield
@@ -57,7 +54,6 @@ app.include_router(payments.router)
 app.include_router(patient_forms.router)
 app.include_router(patient_profile.router)
 app.include_router(patient_documents.router)
-app.include_router(messages.router)
 
 
 @app.get("/health")

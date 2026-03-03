@@ -34,9 +34,6 @@ model User {
   patientRequest   PatientRequest?
   appointmentsAsPatient Appointment[] @relation("PatientAppointments")
   appointmentsAsDoctor   Appointment[] @relation("DoctorAppointments")
-  messageThreadsAsPatient MessageThread[] @relation("PatientMessageThreads")
-  messageThreadsAsDoctor  MessageThread[] @relation("DoctorMessageThreads")
-  sentMessages            Message[]       @relation("SentMessages")
   availabilityBlocks    DoctorAvailability[]
   bookableSlots         DoctorBookableSlot[]
   googleRefreshToken    String?   @map("google_refresh_token")
@@ -154,35 +151,6 @@ model Appointment {
   
   formAssignments PatientFormAssignment[]
   @@map("appointments")
-}
-
-model MessageThread {
-  id        String   @id @default(cuid())
-  patientId String   @map("patient_id")
-  patient   User     @relation("PatientMessageThreads", fields: [patientId], references: [id], onDelete: Cascade)
-  doctorId  String   @map("doctor_id")
-  doctor    User     @relation("DoctorMessageThreads", fields: [doctorId], references: [id], onDelete: Cascade)
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-  messages  Message[]
-
-  @@unique([patientId, doctorId])
-  @@map("message_threads")
-}
-
-model Message {
-  id        String        @id @default(cuid())
-  threadId  String        @map("thread_id")
-  thread    MessageThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
-  senderId  String        @map("sender_id")
-  sender    User          @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
-  body      String        @db.Text
-  readAt    DateTime?     @map("read_at")
-  createdAt DateTime      @default(now()) @map("created_at")
-
-  @@index([threadId, createdAt])
-  @@index([threadId, readAt])
-  @@map("messages")
 }
 
 // Master list of all available forms (questionnaires + PDF templates)

@@ -27,40 +27,40 @@ from app.db import connect_db, disconnect_db, get_db
 
 FORMS_TO_SEED = [
     {
-        "title": "Clinical Workflow Blueprint",
-        "description": "Download, complete, and upload this PDF form.",
-        "type": "pdf_upload",
-        "templateGcsPath": "forms/templates/Clinical_Workflow_Blueprint.pdf",
-    },
-    {
-        "title": "Design Flow",
-        "description": "Download, complete, and upload this PDF form.",
-        "type": "pdf_upload",
-        "templateGcsPath": "forms/templates/Design_Flow.pdf",
-    },
-    {
-        "title": "Pediatric Symptom Checklist (PSC-17)",
-        "description": "Screening for emotional, attention, and behavior difficulties. Options: Never, Sometimes, Often.",
-        "type": "questionnaire",
-        "questionnaireKey": "psc17",
-    },
-    {
-        "title": "PHQ-A (Adolescent Depression Questionnaire)",
-        "description": "Over the last 2 weeks, how often have you been bothered by the following problems? Options: Not at all, Several days, More than half the days, Nearly every day.",
+        "title": "PHQ-A (Adolescents 11-17 years)",
+        "description": "Adolescent depression screening for ages 11-17. Choose one response per item.",
         "type": "questionnaire",
         "questionnaireKey": "phqa",
     },
     {
-        "title": "Medication Review",
-        "description": "Review your current medications and any side effects.",
+        "title": "PHQ-9 (Adults 18+)",
+        "description": "Adult depression screening for ages 18+.",
         "type": "questionnaire",
-        "questionnaireKey": "medication_review",
+        "questionnaireKey": "phq9",
     },
     {
-        "title": "Mood Tracking",
-        "description": "Track your mood and daily activities.",
+        "title": "SCARED - Child Version (Ages 8-18)",
+        "description": "Child anxiety screening for ages 8-18.",
         "type": "questionnaire",
-        "questionnaireKey": "mood_tracking",
+        "questionnaireKey": "scared_child",
+    },
+    {
+        "title": "SCARED - Parent Version",
+        "description": "Parent-report anxiety screening over the past 3 months.",
+        "type": "questionnaire",
+        "questionnaireKey": "scared_parent",
+    },
+    {
+        "title": "DSM-Based ADHD Parent Rating Scale",
+        "description": "ADHD symptom rating scale (parent report) for the past 6 months.",
+        "type": "questionnaire",
+        "questionnaireKey": "adhd_parent_rating",
+    },
+    {
+        "title": "DSM-Based ADHD Teacher Rating Scale",
+        "description": "ADHD symptom rating scale (teacher report) for the past 6 months.",
+        "type": "questionnaire",
+        "questionnaireKey": "adhd_teacher_rating",
     },
 ]
 

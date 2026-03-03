@@ -1154,7 +1154,8 @@ async def reschedule_appointment(
 ):
     """
     Reschedule an appointment to a new time.
-    Allowed until 48 hours before the appointment. Patient and doctor can both reschedule.
+    Patient: allowed until 48 hours before the appointment.
+    Doctor: can reschedule until the appointment is completed/cancelled.
     """
     db = await get_db()
     appointment = await db.appointment.find_unique(
@@ -1185,13 +1186,14 @@ async def reschedule_appointment(
     if scheduled_at.tzinfo is None:
         scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
 
-    now = datetime.now(timezone.utc)
-    hours_until = (scheduled_at - now).total_seconds() / 3600
-    if hours_until < RESCHEDULE_MIN_HOURS_BEFORE:
-        raise HTTPException(
-            status_code=400,
-            detail="Reschedule is only allowed until 48 hours before the appointment.",
-        )
+    if role == "patient":
+        now = datetime.now(timezone.utc)
+        hours_until = (scheduled_at - now).total_seconds() / 3600
+        if hours_until < RESCHEDULE_MIN_HOURS_BEFORE:
+            raise HTTPException(
+                status_code=400,
+                detail="Reschedule is only allowed until 48 hours before the appointment.",
+            )
 
     try:
         new_scheduled_at = datetime.fromisoformat(body.scheduledAt.replace("Z", "+00:00"))

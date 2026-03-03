@@ -15,8 +15,8 @@ INSERT INTO forms (
 )
 SELECT
   gen_random_uuid()::text,
-  'PHQ-A (Adolescent Depression Questionnaire)',
-  'Over the last 2 weeks, how often have you been bothered by the following problems? Options: Not at all, Several days, More than half the days, Nearly every day.',
+  'PHQ-A (Adolescents 11-17 years)',
+  'Adolescent depression screening for ages 11-17. Choose one response per item.',
   'questionnaire',
   'phqa',
   NULL,

@@ -47,6 +47,47 @@ def set_default_payment_method(customer_id: str, payment_method_id: str) -> None
         else:
             raise
 
+    # Sync billing identity/address from the saved payment method to the customer.
+    # This helps Stripe-hosted receipts/invoices show the patient's billing address.
+    try:
+        payment_method = stripe.PaymentMethod.retrieve(payment_method_id)
+        billing = getattr(payment_method, "billing_details", None)
+        if billing:
+            customer_updates: dict = {}
+
+            name = getattr(billing, "name", None)
+            email = getattr(billing, "email", None)
+            phone = getattr(billing, "phone", None)
+            address = getattr(billing, "address", None)
+
+            if name:
+                customer_updates["name"] = name
+            if email:
+                customer_updates["email"] = email
+            if phone:
+                customer_updates["phone"] = phone
+            if address:
+                # Stripe accepts dict-like address objects from PaymentMethod billing details.
+                raw_address = {
+                    "line1": getattr(address, "line1", None),
+                    "line2": getattr(address, "line2", None),
+                    "city": getattr(address, "city", None),
+                    "state": getattr(address, "state", None),
+                    "postal_code": getattr(address, "postal_code", None),
+                    "country": getattr(address, "country", None),
+                }
+                clean_address = {
+                    k: v for k, v in raw_address.items() if v not in (None, "")
+                }
+                if clean_address:
+                    customer_updates["address"] = clean_address
+
+            if customer_updates:
+                stripe.Customer.modify(customer_id, **customer_updates)
+    except Exception:
+        # Don't block card-saving flow if billing sync fails.
+        pass
+
 
 def charge_customer(
     customer_id: str,
