@@ -19,7 +19,10 @@ from app.gcs_service import (
     upload_patient_document,
     blob_exists,
 )
-from app.healthcare_fhir import create_questionnaire_response, get_questionnaire_response_as_form_data
+from app.healthcare_fhir import (
+    create_questionnaire_response,
+    get_questionnaire_response_as_form_data,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -365,8 +368,11 @@ async def get_patient_overview(
             "downloadUrl": download_url or fallback_url,
         })
 
+    fhir_patient_id = getattr(patient, "fhirPatientId", None) or getattr(patient, "fhir_patient_id", None)
+
     return {
         "patientId": patient.id,
+        "fhirPatientId": fhir_patient_id,
         "patientName": f"{first_name} {last_name}".strip(),
         "patientEmail": patient.email,
         "patientPhone": getattr(patient, "phone", None),

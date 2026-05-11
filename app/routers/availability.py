@@ -498,15 +498,50 @@ async def get_available_slots(
     - excludeAppointmentId: when rescheduling, exclude this appointment so its current slot appears available.
     """
     db = await get_db()
-    doctor = await db.user.find_first(where={"role": "doctor"})
-    if not doctor:
-        return {"slots": []}
 
     requested_duration = durationMinutes or SLOT_MINUTES
     if requested_duration <= 0:
         raise HTTPException(status_code=400, detail="durationMinutes must be positive")
 
     start_d, end_d = _get_availability_window()
+
+    # In databases with multiple doctors, using find_first(role="doctor") can
+    # pick a doctor who has no offered slots, so patients see no availability
+    # even when another doctor has configured and offered slots. Prefer:
+    #   1. A doctor who actually has bookable slots for this duration in-window.
+    #   2. A doctor matching DOCTOR_EMAIL (when configured).
+    #   3. Any doctor as final fallback.
+    doctor = None
+
+    # 1) Try to infer the doctor from existing bookable slots.
+    candidate_bookable = await db.doctorbookableslot.find_many(
+        where={
+            "date": _date_range_iso(start_d, end_d),
+            "durationMinutes": requested_duration,
+        },
+        order=[{"doctorId": "asc"}, {"date": "asc"}, {"startTime": "asc"}],
+        take=1,
+    )
+    if candidate_bookable:
+        doctor = await db.user.find_unique(where={"id": candidate_bookable[0].doctorId})
+
+    # 2) Fallback to DOCTOR_EMAIL if no doctor inferred from slots.
+    if doctor is None:
+        import os
+
+        env_email = os.environ.get("DOCTOR_EMAIL")
+        if env_email:
+            maybe_doctor = await db.user.find_unique(where={"email": env_email})
+            if maybe_doctor and getattr(maybe_doctor, "role", None) == "doctor":
+                doctor = maybe_doctor
+
+    # 3) Final fallback to any doctor.
+    if doctor is None:
+        doctor = await db.user.find_first(where={"role": "doctor"})
+
+    if not doctor:
+        return {"slots": []}
+
     bookable = await db.doctorbookableslot.find_many(
         where={
             "doctorId": doctor.id,

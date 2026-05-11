@@ -39,6 +39,7 @@ model User {
   googleRefreshToken    String?   @map("google_refresh_token")
   googleCalendarId     String?   @map("google_calendar_id")
   stripeCustomerId     String?   @unique @map("stripe_customer_id")
+  fhirPatientId       String?   @map("fhir_patient_id") // GCP Cloud Healthcare FHIR Patient.id
   formAssignments PatientFormAssignment[] @relation("PatientFormAssignments")
   patientDocuments PatientDocument[]
   allowedFollowupTypes Json? @map("allowed_followup_types") // ["followup_med_30", "followup_med_therapy_45"] set by doctor after intake
@@ -146,6 +147,7 @@ model Appointment {
   googleCalendarEventId String? @map("google_calendar_event_id") // For update/delete on reschedule or cancel
   fhirEncounterId String? @map("fhir_encounter_id") // FHIR Encounter for HIPAA-compliant encounter notes
   requireFormsBeforeConfirm Boolean @default(true) @map("require_forms_before_confirm") // If true, patient must complete assigned forms before confirming
+  patientRescheduleCount    Int     @default(0) @map("patient_reschedule_count") // Patient can reschedule only once; doctor reschedules do not increment
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
   

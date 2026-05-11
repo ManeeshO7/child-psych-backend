@@ -16,7 +16,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db import connect_db, disconnect_db
-from app.routers import auth, contact, request_access, patient_requests, appointments, availability, payments, patient_forms, patient_profile, patient_documents
+from app.routers import (
+    appointments,
+    auth,
+    availability,
+    contact,
+    patient_documents,
+    patient_forms,
+    patient_profile,
+    patient_requests,
+    payments,
+    request_access,
+)
 
 
 @asynccontextmanager

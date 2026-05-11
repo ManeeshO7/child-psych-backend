@@ -9,7 +9,11 @@ from app.auth import generate_reset_token
 from app.db import get_db
 from app.dependencies import require_doctor
 from app.email_service import send_acceptance_message_email, send_approval_email, send_rejection_email
-from app.healthcare_fhir import delete_questionnaire_response, get_questionnaire_response_as_form_data
+from app.healthcare_fhir import (
+    delete_questionnaire_response,
+    ensure_fhir_patient_for_user,
+    get_questionnaire_response_as_form_data,
+)
 
 router = APIRouter(prefix="/api/patient-requests", tags=["patient-requests"])
 
@@ -109,6 +113,12 @@ async def approve(id: str, session: dict = Depends(require_doctor)):
             "userId": user.id,
         },
     )
+    # Create GCP FHIR Patient and link to user
+    try:
+        await ensure_fhir_patient_for_user(db, user.id)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("FHIR Patient ensure after approve failed: %s", e)
     # Send emails via Resend (acceptance + approval with credentials)
     import logging
     _log = logging.getLogger(__name__)

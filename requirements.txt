@@ -27,3 +27,9 @@ google-auth-httplib2==0.2.0
 
 # Google Cloud Storage (for PDF form uploads)
 google-cloud-storage>=2.10.0
+
+# HTTP client for OpenEMR / external APIs
+httpx
+
+# JWT for OpenEMR OAuth2 client assertion (when app uses JWKS)
+PyJWT[crypto]>=2.8.0

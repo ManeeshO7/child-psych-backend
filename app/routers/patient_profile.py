@@ -10,6 +10,11 @@ from pydantic import BaseModel, Field
 
 from app.db import get_db
 from app.dependencies import require_patient
+from app.healthcare_fhir import (
+    build_fhir_patient_payload,
+    ensure_fhir_patient_for_user,
+    update_fhir_resource,
+)
 
 router = APIRouter(prefix="/api/patient-profile", tags=["patient-profile"])
 
@@ -39,15 +44,21 @@ def _profile_is_complete(user, profile) -> bool:
     """Check if profile has all required fields for orientation booking."""
     if not profile:
         return False
-    # Required: name (on user), sex, dob, ssn, phone, preferred pharmacy
+    # Required: name (on user), sex, dob, ssn, phone, address, preferred pharmacy, parent 1
     first = (getattr(user, "firstName", None) or getattr(user, "first_name", "") or "").strip()
     last = (getattr(user, "lastName", None) or getattr(user, "last_name", "") or "").strip()
     phone = (getattr(user, "phone", None) or "").strip()
     sex = (getattr(profile, "sex", None) or "").strip()
     dob = getattr(profile, "dateOfBirth", None) or getattr(profile, "date_of_birth", None)
     ssn = (getattr(profile, "ssn", None) or "").strip()
+    address = (getattr(profile, "address", None) or "").strip()
     pharmacy = (getattr(profile, "preferredPharmacyName", None) or getattr(profile, "preferred_pharmacy_name", None) or "").strip()
-    return bool(first and last and phone and sex and dob and ssn and pharmacy)
+    pharmacy_address = (getattr(profile, "preferredPharmacyAddress", None) or getattr(profile, "preferred_pharmacy_address", None) or "").strip()
+    g1_name = (getattr(profile, "guardian1Name", None) or getattr(profile, "guardian_1_name", None) or "").strip()
+    g1_relationship = (getattr(profile, "guardian1Relationship", None) or getattr(profile, "guardian_1_relationship", None) or "").strip()
+    g1_phone = (getattr(profile, "guardian1Phone", None) or getattr(profile, "guardian_1_phone", None) or "").strip()
+    g1_address = (getattr(profile, "guardian1Address", None) or getattr(profile, "guardian_1_address", None) or "").strip()
+    return bool(first and last and phone and sex and dob and ssn and address and pharmacy and pharmacy_address and g1_name and g1_relationship and g1_phone and g1_address)
 
 
 @router.get("/")
@@ -211,5 +222,15 @@ async def update_my_profile(body: PatientProfileUpdateBody, session: dict = Depe
             where={"id": profile.id},
             data={"completedAt": datetime.now(timezone.utc)},
         )
+
+    # Ensure GCP FHIR Patient exists and stays in sync
+    try:
+        fhir_id = await ensure_fhir_patient_for_user(db, session["id"])
+        if fhir_id and profile:
+            payload = build_fhir_patient_payload(user, profile)
+            payload["id"] = fhir_id
+            update_fhir_resource("Patient", fhir_id, payload)
+    except Exception:
+        pass  # Non-fatal; FHIR may be disabled
 
     return {"ok": True}

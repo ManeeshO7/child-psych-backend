@@ -96,6 +96,9 @@ def _serialize_appointment(
         out["hasPendingFormsForThisAppointment"] = has_pending_forms_for_this_appointment
     if forms_assigned_count is not None:
         out["formsAssignedCount"] = forms_assigned_count
+    resched_count = getattr(a, "patientRescheduleCount", None) or getattr(a, "patient_reschedule_count", None)
+    if resched_count is not None:
+        out["patientRescheduleCount"] = resched_count
     return out
 
 
@@ -1027,7 +1030,6 @@ async def update_appointment(
     return _serialize_appointment(updated, include_patient=True, include_doctor=True)
 
 
-RESCHEDULE_MIN_HOURS_BEFORE = 48
 RESCHEDULABLE_STATUSES = {"scheduled", "card_on_file", "paid"}
 
 
@@ -1154,7 +1156,7 @@ async def reschedule_appointment(
 ):
     """
     Reschedule an appointment to a new time.
-    Patient: allowed until 48 hours before the appointment.
+    Patient: allowed once per appointment (no 48-hour restriction).
     Doctor: can reschedule until the appointment is completed/cancelled.
     """
     db = await get_db()
@@ -1180,20 +1182,21 @@ async def reschedule_appointment(
             detail=f"Cannot reschedule appointment with status '{status}'.",
         )
 
+    # Patient may reschedule only once per appointment
+    patient_reschedule_count = getattr(appointment, "patientRescheduleCount", None) or getattr(
+        appointment, "patient_reschedule_count", None
+    ) or 0
+    if role == "patient" and patient_reschedule_count >= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="You can reschedule this appointment online only once. Please contact the practice for further changes.",
+        )
+
     scheduled_at = getattr(appointment, "scheduledAt", None) or getattr(appointment, "scheduled_at", None)
     if not scheduled_at:
         raise HTTPException(status_code=400, detail="Appointment has no scheduled time")
     if scheduled_at.tzinfo is None:
         scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
-
-    if role == "patient":
-        now = datetime.now(timezone.utc)
-        hours_until = (scheduled_at - now).total_seconds() / 3600
-        if hours_until < RESCHEDULE_MIN_HOURS_BEFORE:
-            raise HTTPException(
-                status_code=400,
-                detail="Reschedule is only allowed until 48 hours before the appointment.",
-            )
 
     try:
         new_scheduled_at = datetime.fromisoformat(body.scheduledAt.replace("Z", "+00:00"))
@@ -1322,6 +1325,8 @@ async def reschedule_appointment(
         update_data["meetLink"] = meet_link
     if google_calendar_event_id is not None:
         update_data["googleCalendarEventId"] = google_calendar_event_id
+    if role == "patient":
+        update_data["patientRescheduleCount"] = patient_reschedule_count + 1
 
     updated = await db.appointment.update(
         where={"id": id},
