@@ -9,13 +9,13 @@ def _wrap_email_html(*, heading: str, body_html: str, brand: str = "TelePsych") 
     Basic responsive transactional email wrapper.
     Uses table layout + inline styles for broad email client support.
     """
-    # Palette roughly aligned with site (warm brown + cream)
-    brand_bg = "#7A5C3B"
-    page_bg = "#F8F5EF"
+    # Palette aligned with site header/footer (sage green)
+    brand_bg = "#7A9E84"
+    page_bg = "#F4F6F4"
     card_bg = "#FFFFFF"
     text = "#1F2937"
     muted = "#6B7280"
-    border = "#E6DDCF"
+    border = "#D4E0D6"
 
     return f"""\
 <!doctype html>
@@ -67,10 +67,10 @@ def _wrap_email_html(*, heading: str, body_html: str, brand: str = "TelePsych") 
 
 def _button(href: str, label: str) -> str:
     """CTA button with fallback-friendly styling."""
-    btn_bg = "#7A5C3B"
+    btn_bg = "#7A9E84"
     return f"""\
 <div style="margin:18px 0;">
-  <a href="{href}" style="display:inline-block;background:{btn_bg};color:#ffffff;text-decoration:none;padding:12px 16px;border-radius:10px;font-weight:700;">
+  <a href="{href}" style="display:inline-block;background:{btn_bg};color:#ffffff;text-decoration:none;padding:12px 20px;border-radius:10px;font-weight:700;">
     {label}
   </a>
 </div>
@@ -127,7 +127,7 @@ def send_acceptance_message_email(to: str, first_name: str) -> tuple[bool, Optio
     """Send the practice acceptance message (good fit, next steps). Sent when doctor approves."""
     # Styled box for next steps (warm cream, matches site palette)
     next_steps_box = """
-    <div style="margin:18px 0;padding:18px 20px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+    <div style="margin:18px 0;padding:18px 20px;border:1px solid #C5D9C9;border-radius:12px;background:#F0F7F2;">
       <div style="font-weight:700;font-size:15px;margin-bottom:10px;color:#1F2937;">Next steps</div>
       <ol style="margin:0;padding-left:20px;line-height:1.8;">
         <li>Log in to the patient portal with the email and password provided in a separate message.</li>
@@ -137,7 +137,7 @@ def send_acceptance_message_email(to: str, first_name: str) -> tuple[bool, Optio
     </div>
     """
     note_box = """
-    <div style="margin:18px 0;padding:14px 16px;border:1px solid #E6DDCF;border-radius:10px;background:#FAFAF9;font-size:13px;color:#4B5563;">
+    <div style="margin:18px 0;padding:14px 16px;border:1px solid #C5D9C9;border-radius:10px;background:#F0F7F2;font-size:13px;color:#4B5563;">
       A physician–patient relationship is established only after your profile is completed and the orientation appointment has occurred.
     </div>
     """
@@ -167,7 +167,7 @@ def send_acceptance_message_email(to: str, first_name: str) -> tuple[bool, Optio
 def send_rejection_email(to: str, first_name: str, rejected_note: Optional[str] = None) -> tuple[bool, Optional[str]]:
     """Send the non-fit / referral message when doctor rejects the request."""
     extra = (
-        f"""<div style="margin-top:14px;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+        f"""<div style="margin-top:14px;padding:12px 14px;border:1px solid #C5D9C9;border-radius:12px;background:#F0F7F2;">
         <div style="font-weight:700;margin-bottom:6px;">Note from the practice</div>
         <div>{rejected_note}</div>
       </div>"""
@@ -229,9 +229,9 @@ def send_approval_email(
 <p>Your request for access to TelePsych has been approved.</p>
 <p>To finish setting up your account, please create your password using the secure link below:</p>
 {_button(reset_link, "Set Password")}
-<div style="margin-top:10px;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+<div style="margin-top:10px;padding:12px 14px;border:1px solid #C5D9C9;border-radius:12px;background:#F0F7F2;">
   <div style="font-weight:700;margin-bottom:6px;">Or copy this link</div>
-  <div style="word-break:break-all;"><a href="{reset_link}" style="color:#7A5C3B;">{reset_link}</a></div>
+  <div style="word-break:break-all;"><a href="{reset_link}" style="color:#7A9E84;">{reset_link}</a></div>
 </div>
 <div style="margin-top:14px;padding:12px 14px;border:1px solid #F3D8A4;border-radius:12px;background:#FFF7E6;">
   <div style="font-weight:700;margin-bottom:6px;">Important</div>
@@ -271,11 +271,11 @@ def send_appointment_confirmation_email(
     meet_section = ""
     if meet_link:
         meet_section = f"""
-<div style="margin-top:14px;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+<div style="margin-top:14px;padding:12px 14px;border:1px solid #C5D9C9;border-radius:12px;background:#F0F7F2;">
   <div style="font-weight:700;margin-bottom:6px;">Join your video visit</div>
   <p style="margin:0 0 10px 0;">Use this link at your appointment time:</p>
   {_button(meet_link, "Join video call")}
-  <div style="margin-top:8px;word-break:break-all;"><a href="{meet_link}" style="color:#7A5C3B;">{meet_link}</a></div>
+  <div style="margin-top:8px;word-break:break-all;"><a href="{meet_link}" style="color:#7A9E84;">{meet_link}</a></div>
 </div>
 """
     else:
@@ -288,7 +288,7 @@ def send_appointment_confirmation_email(
     body = f"""
 <p>Hello {patient_first_name},</p>
 <p>Your appointment has been confirmed.</p>
-<div style="margin:14px 0;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+<div style="margin:14px 0;padding:12px 14px;border:1px solid #C5D9C9;border-radius:12px;background:#F0F7F2;">
   <div style="font-weight:700;margin-bottom:6px;">Date & time</div>
   <div>{date_str}</div>
 </div>
@@ -326,11 +326,11 @@ def send_appointment_rescheduled_email(
     meet_section = ""
     if meet_link:
         meet_section = f"""
-<div style="margin-top:14px;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+<div style="margin-top:14px;padding:12px 14px;border:1px solid #C5D9C9;border-radius:12px;background:#F0F7F2;">
   <div style="font-weight:700;margin-bottom:6px;">Join your video visit</div>
   <p style="margin:0 0 10px 0;">Use this link at your appointment time:</p>
   {_button(meet_link, "Join video call")}
-  <div style="margin-top:8px;word-break:break-all;"><a href="{meet_link}" style="color:#7A5C3B;">{meet_link}</a></div>
+  <div style="margin-top:8px;word-break:break-all;"><a href="{meet_link}" style="color:#7A9E84;">{meet_link}</a></div>
 </div>
 """
     else:
@@ -343,7 +343,7 @@ def send_appointment_rescheduled_email(
     body = f"""
 <p>Hello {patient_first_name},</p>
 <p>Your appointment has been rescheduled.</p>
-<div style="margin:14px 0;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+<div style="margin:14px 0;padding:12px 14px;border:1px solid #C5D9C9;border-radius:12px;background:#F0F7F2;">
   <div style="font-weight:700;margin-bottom:6px;">New date & time</div>
   <div>{date_str}</div>
 </div>
@@ -367,9 +367,9 @@ def send_card_update_request(to_email: str, patient_name: str) -> tuple[bool, Op
 <p>We tried to charge your card for your recent visit, but the charge was declined.</p>
 <p>Please update your payment method using the link below so we can complete your payment.</p>
 {_button(save_card_link, "Update payment method")}
-<div style="margin-top:10px;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+<div style="margin-top:10px;padding:12px 14px;border:1px solid #C5D9C9;border-radius:12px;background:#F0F7F2;">
   <div style="font-weight:700;margin-bottom:6px;">Or copy this link</div>
-  <div style="word-break:break-all;"><a href="{save_card_link}" style="color:#7A5C3B;">{save_card_link}</a></div>
+  <div style="word-break:break-all;"><a href="{save_card_link}" style="color:#7A9E84;">{save_card_link}</a></div>
 </div>
 <p style="margin-top:16px;">Best regards,<br/>TelePsych</p>
 """
@@ -402,9 +402,9 @@ def send_password_reset_email(
 <p>Hello {first_name},</p>
 <p>We received a request to reset your password.</p>
 {_button(reset_link, "Reset Password")}
-<div style="margin-top:10px;padding:12px 14px;border:1px solid #E6DDCF;border-radius:12px;background:#FBF9F5;">
+<div style="margin-top:10px;padding:12px 14px;border:1px solid #C5D9C9;border-radius:12px;background:#F0F7F2;">
   <div style="font-weight:700;margin-bottom:6px;">Or copy this link</div>
-  <div style="word-break:break-all;"><a href="{reset_link}" style="color:#7A5C3B;">{reset_link}</a></div>
+  <div style="word-break:break-all;"><a href="{reset_link}" style="color:#7A9E84;">{reset_link}</a></div>
 </div>
 <div style="margin-top:14px;padding:12px 14px;border:1px solid #F3D8A4;border-radius:12px;background:#FFF7E6;">
   <div style="font-weight:700;margin-bottom:6px;">Important</div>

@@ -148,6 +148,8 @@ model Appointment {
   fhirEncounterId String? @map("fhir_encounter_id") // FHIR Encounter for HIPAA-compliant encounter notes
   requireFormsBeforeConfirm Boolean @default(true) @map("require_forms_before_confirm") // If true, patient must complete assigned forms before confirming
   patientRescheduleCount    Int     @default(0) @map("patient_reschedule_count") // Patient can reschedule only once; doctor reschedules do not increment
+  chargedAt      DateTime? @map("charged_at") // Set when payment is successfully collected
+  amountCents    Int?      @map("amount_cents") // Amount charged in cents
   createdAt      DateTime @default(now()) @map("created_at")
   updatedAt      DateTime @updatedAt @map("updated_at")
   

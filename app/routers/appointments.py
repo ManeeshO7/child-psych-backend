@@ -99,6 +99,12 @@ def _serialize_appointment(
     resched_count = getattr(a, "patientRescheduleCount", None) or getattr(a, "patient_reschedule_count", None)
     if resched_count is not None:
         out["patientRescheduleCount"] = resched_count
+    charged_at = getattr(a, "chargedAt", None) or getattr(a, "charged_at", None)
+    amount_cents = getattr(a, "amountCents", None) or getattr(a, "amount_cents", None)
+    if charged_at is not None:
+        out["chargedAt"] = charged_at.isoformat()
+    if amount_cents is not None:
+        out["amountCents"] = amount_cents
     return out
 
 
@@ -1411,9 +1417,10 @@ async def charge_appointment(id: str, session: dict = Depends(require_doctor)):
             except Exception:
                 pass
         raise HTTPException(status_code=400, detail=e.user_message or "Card charge failed")
+    from datetime import datetime, timezone
     await db.appointment.update(
         where={"id": id},
-        data={"status": "paid"},
+        data={"status": "paid", "chargedAt": datetime.now(timezone.utc), "amountCents": amount_cents},
     )
     return {"ok": True, "status": "paid", "message": "Payment successful. Receipt sent by Stripe."}
 
