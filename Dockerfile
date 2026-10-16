@@ -40,48 +40,18 @@ COPY --from=prisma /usr/local/lib/python3.12/site-packages/prisma /usr/local/lib
 COPY --from=prisma /root/.cache/prisma-python /root/.cache/prisma-python
 
 # Copy the query engine binary into /app, which Prisma checks first.
-RUN python3 - <<'PY'
-import os
-import shutil
-import stat
-
-root = "/root/.cache/prisma-python/binaries"
-preferred_names = (
-    "query-engine-debian-openssl-3.5.x",
-    "query-engine-debian-openssl-3.0.x",
-)
-
-def find_engine() -> str:
-    preferred_hits: list[str] = []
-    fallback_hits: list[str] = []
-    for dp, _, files in os.walk(root):
-        for f in files:
-            if f in preferred_names:
-                preferred_hits.append(os.path.join(dp, f))
-            elif f.startswith("query-engine-"):
-                fallback_hits.append(os.path.join(dp, f))
-    if preferred_hits:
-        preferred_hits.sort()
-        return preferred_hits[0]
-    if fallback_hits:
-        fallback_hits.sort()
-        return fallback_hits[0]
-    raise SystemExit(
-        f"No Prisma query engine found under {root}. "
-        "Expected a file named like query-engine-debian-openssl-3.0.x"
-    )
-
-src = find_engine()
-
-def install(dst: str) -> None:
-    shutil.copyfile(src, dst)
-    os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-# Prisma Client Python checks /app for prisma-query-engine-* first.
-install("/app/prisma-query-engine-debian-openssl-3.5.x")
-install("/app/prisma-query-engine-debian-openssl-3.0.x")
-print("Installed Prisma query engine from", src)
-PY
+RUN python3 -c "\
+import os, shutil, stat; \
+root = '/root/.cache/prisma-python/binaries'; \
+preferred = ('query-engine-debian-openssl-3.5.x', 'query-engine-debian-openssl-3.0.x'); \
+hits = [os.path.join(dp, f) for dp, _, files in os.walk(root) for f in files if f.startswith('query-engine-')]; \
+pref = sorted([h for h in hits if any(p in h for p in preferred)]); \
+src = pref[0] if pref else (sorted(hits)[0] if hits else (_ for _ in ()).throw(SystemExit('No Prisma engine found'))); \
+install = lambda dst: (shutil.copyfile(src, dst), os.chmod(dst, os.stat(dst).st_mode | 0o111)); \
+install('/app/prisma-query-engine-debian-openssl-3.5.x'); \
+install('/app/prisma-query-engine-debian-openssl-3.0.x'); \
+print('Installed Prisma query engine from', src) \
+"
 
 # App code
 COPY app ./app
