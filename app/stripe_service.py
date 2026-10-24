@@ -26,10 +26,18 @@ def get_or_create_customer(user_id: str, email: str, existing_stripe_id: Optiona
 
 
 def create_setup_intent(customer_id: str) -> str:
-    """Create a SetupIntent for saving a card (no charge). Returns client_secret."""
+    """Create a SetupIntent for saving a card (no charge). Returns client_secret.
+
+    `payment_method_types` is no longer accepted by Stripe's API; payment
+    methods are now controlled from the Dashboard. We use
+    `automatic_payment_methods` with `allow_redirects: "never"` to keep this
+    to card-based methods (including Apple Pay / Google Pay, which ride on
+    the card rails and don't redirect) while excluding redirect-based wallets
+    like Klarna, BLIK, or Amazon Pay that the Dashboard has enabled.
+    """
     intent = stripe.SetupIntent.create(
         customer=customer_id,
-        payment_method_types=["card"],
+        automatic_payment_methods={"enabled": True, "allow_redirects": "never"},
         usage="off_session",
     )
     return intent.client_secret

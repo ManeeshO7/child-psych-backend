@@ -132,23 +132,122 @@ async def list_all_patients(
     }
 
 
+def _serialize_form(f) -> dict:
+    return {
+        "id": f.id,
+        "title": f.title,
+        "description": getattr(f, "description", None),
+        "type": f.type,
+        "questionnaireKey": getattr(f, "questionnaireKey", None) or getattr(f, "questionnaire_key", None),
+        "templateGcsPath": getattr(f, "templateGcsPath", None) or getattr(f, "template_gcs_path", None),
+        "isActive": getattr(f, "isActive", True) if getattr(f, "isActive", None) is not None else getattr(f, "is_active", True),
+    }
+
+
 @router.get("/forms")
-async def list_all_forms(session: dict = Depends(require_doctor)):
-    """List all available forms (active only)."""
+async def list_all_forms(
+    includeInactive: bool = Query(False),
+    session: dict = Depends(require_doctor),
+):
+    """List forms. By default only active forms (used by the assign-forms picker).
+    Pass includeInactive=true for the doctor's form management view."""
     db = await get_db()
-    forms = await db.form.find_many(where={"isActive": True}, order={"createdAt": "desc"})
-    return [
-        {
-            "id": f.id,
-            "title": f.title,
-            "description": getattr(f, "description", None),
-            "type": f.type,
-            "questionnaireKey": getattr(f, "questionnaireKey", None) or getattr(f, "questionnaire_key", None),
-            "templateGcsPath": getattr(f, "templateGcsPath", None) or getattr(f, "template_gcs_path", None),
-            "isActive": getattr(f, "isActive", True) or getattr(f, "is_active", True),
+    where = {} if includeInactive else {"isActive": True}
+    forms = await db.form.find_many(where=where, order={"createdAt": "desc"})
+    return [_serialize_form(f) for f in forms]
+
+
+class CreatePdfFormBody(BaseModel):
+    title: str
+    description: str | None = None
+
+
+class UpdateFormBody(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    isActive: bool | None = None
+
+
+@router.post("/forms/pdf")
+async def create_pdf_form(
+    title: str = Form(...),
+    description: str | None = Form(None),
+    file: UploadFile = File(...),
+    session: dict = Depends(require_doctor),
+):
+    """Create a new PDF-upload form: doctor uploads a blank template PDF that
+    patients will later download, fill out, and upload back completed."""
+    title = title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="File is empty")
+
+    db = await get_db()
+    existing = await db.form.find_first(where={"title": title})
+    if existing:
+        raise HTTPException(status_code=400, detail="A form with this title already exists")
+
+    form = await db.form.create(
+        data={
+            "title": title,
+            "description": (description or "").strip() or None,
+            "type": "pdf_upload",
         }
-        for f in forms
-    ]
+    )
+
+    blob_name = f"forms/templates/{form.id}.pdf"
+    uploaded_path = upload_patient_document(
+        TEMPLATES_BUCKET,
+        blob_name,
+        content,
+        content_type="application/pdf",
+    )
+    if not uploaded_path:
+        # Clean up the form row so we don't leave a template-less pdf_upload form around.
+        await db.form.delete(where={"id": form.id})
+        raise HTTPException(status_code=500, detail="Failed to upload template PDF")
+
+    form = await db.form.update(
+        where={"id": form.id},
+        data={"templateGcsPath": uploaded_path},
+    )
+    return _serialize_form(form)
+
+
+@router.patch("/forms/{form_id}")
+async def update_form(
+    form_id: str,
+    body: UpdateFormBody,
+    session: dict = Depends(require_doctor),
+):
+    """Edit a form's title/description, or activate/deactivate it.
+    Deactivating hides it from the assign-forms picker without deleting
+    assignment/submission history (forms are never hard-deleted)."""
+    db = await get_db()
+    existing = await db.form.find_unique(where={"id": form_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Form not found")
+
+    data: dict = {}
+    if body.title is not None:
+        title = body.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="Title cannot be empty")
+        data["title"] = title
+    if body.description is not None:
+        data["description"] = body.description.strip() or None
+    if body.isActive is not None:
+        data["isActive"] = body.isActive
+
+    if not data:
+        return _serialize_form(existing)
+
+    form = await db.form.update(where={"id": form_id}, data=data)
+    return _serialize_form(form)
 
 
 @router.post("/assign")

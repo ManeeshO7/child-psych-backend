@@ -201,7 +201,10 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
     )
     has_pending_clinical_intake = pending_clinical is not None
 
-    # Check if patient profile is complete (required before orientation)
+    # Check if patient profile is complete (required before orientation).
+    # Preferred pharmacy is intentionally NOT required here: it's only
+    # collected once a clinical intake is confirmed, which happens after
+    # orientation, so it can't be a precondition for booking orientation.
     profile_complete = False
     profile = getattr(patient_user, "patientProfile", None)
     if profile:
@@ -211,8 +214,7 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
         sex = (getattr(profile, "sex", None) or "").strip()
         dob = getattr(profile, "dateOfBirth", None) or getattr(profile, "date_of_birth", None)
         ssn = (getattr(profile, "ssn", None) or "").strip()
-        pharmacy = (getattr(profile, "preferredPharmacyName", None) or getattr(profile, "preferred_pharmacy_name", None) or "").strip()
-        profile_complete = bool(first and last and phone and sex and dob and ssn and pharmacy)
+        profile_complete = bool(first and last and phone and sex and dob and ssn)
 
     allowed = []
     if not has_any_orientation_appointment and profile_complete:
@@ -260,7 +262,7 @@ async def get_allowed_appointment_types(session: dict = Depends(require_patient)
         if has_any_orientation_appointment:
             not_allowed_reasons["orientation_consult"] = "You already have an orientation appointment (scheduled or completed)."
         elif not profile_complete:
-            not_allowed_reasons["orientation_consult"] = "Complete your profile first (Name, Sex, DOB, SSN, Contact, Pharmacy)."
+            not_allowed_reasons["orientation_consult"] = "Complete your profile first (Name, Sex, DOB, SSN, Contact)."
     if "clinical_intake" not in allowed_set:
         if not has_orientation:
             not_allowed_reasons["clinical_intake"] = "Complete your initial evaluation (orientation) first."
@@ -594,7 +596,9 @@ async def create_appointment(
     if body.type == "orientation_consult":
         if has_orientation:
             raise HTTPException(status_code=403, detail="You have already completed orientation. You can book clinical intake or follow-ups.")
-        # Require complete profile before orientation
+        # Require complete profile before orientation. Preferred pharmacy is
+        # intentionally not required here — it's only collected once a
+        # clinical intake is confirmed, which happens after orientation.
         profile = getattr(patient_user, "patientProfile", None)
         first = (getattr(patient_user, "firstName", None) or getattr(patient_user, "first_name", "") or "").strip()
         last = (getattr(patient_user, "lastName", None) or getattr(patient_user, "last_name", "") or "").strip()
@@ -602,11 +606,10 @@ async def create_appointment(
         sex = (getattr(profile, "sex", None) or "").strip() if profile else ""
         dob = getattr(profile, "dateOfBirth", None) or getattr(profile, "date_of_birth", None) if profile else None
         ssn = (getattr(profile, "ssn", None) or "").strip() if profile else ""
-        pharmacy = (getattr(profile, "preferredPharmacyName", None) or getattr(profile, "preferred_pharmacy_name", None) or "").strip() if profile else ""
-        if not (first and last and phone and sex and dob and ssn and pharmacy):
+        if not (first and last and phone and sex and dob and ssn):
             raise HTTPException(
                 status_code=403,
-                detail="Complete your profile first (Name, Sex, DOB, SSN, Contact info, Preferred Pharmacy) before booking orientation.",
+                detail="Complete your profile first (Name, Sex, DOB, SSN, Contact info) before booking orientation.",
             )
     if body.type == "clinical_intake":
         if not has_orientation:

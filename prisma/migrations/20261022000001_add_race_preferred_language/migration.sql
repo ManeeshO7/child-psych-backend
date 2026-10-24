@@ -1,0 +1,2 @@
+ALTER TABLE "patient_profiles" ADD COLUMN IF NOT EXISTS "race" TEXT;
+ALTER TABLE "patient_profiles" ADD COLUMN IF NOT EXISTS "preferred_language" TEXT;

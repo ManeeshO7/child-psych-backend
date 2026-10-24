@@ -18,12 +18,33 @@ from app.healthcare_fhir import (
 
 router = APIRouter(prefix="/api/patient-profile", tags=["patient-profile"])
 
+# Any clinical_intake appointment that isn't cancelled counts as "scheduled"
+# for the purpose of unlocking the preferred-pharmacy fields — including one
+# still awaiting the patient's confirmation.
+_SCHEDULED_APPOINTMENT_STATUSES = ["pending_confirmation", "scheduled", "card_on_file", "paid", "completed"]
+
+
+async def _has_confirmed_clinical_intake(db, patient_id: str) -> bool:
+    """Preferred pharmacy is only collected once the patient has a clinical
+    intake appointment scheduled (any non-cancelled status)."""
+    match = await db.appointment.find_first(
+        where={
+            "patientId": patient_id,
+            "type": "clinical_intake",
+            "status": {"in": _SCHEDULED_APPOINTMENT_STATUSES},
+        },
+    )
+    return match is not None
+
 
 class PatientProfileUpdateBody(BaseModel):
     firstName: Optional[str] = Field(None, min_length=1)
     lastName: Optional[str] = Field(None, min_length=1)
+    preferredName: Optional[str] = None
     phone: Optional[str] = None
     sex: Optional[str] = None  # male | female | other | prefer_not_to_say
+    race: Optional[str] = None
+    preferredLanguage: Optional[str] = None
     dateOfBirth: Optional[str] = None  # YYYY-MM-DD
     ssn: Optional[str] = None
     address: Optional[str] = None
@@ -33,18 +54,26 @@ class PatientProfileUpdateBody(BaseModel):
     guardian1Name: Optional[str] = None
     guardian1Relationship: Optional[str] = None
     guardian1Phone: Optional[str] = None
+    guardian1Email: Optional[str] = None
     guardian1Address: Optional[str] = None
     guardian2Name: Optional[str] = None
     guardian2Relationship: Optional[str] = None
     guardian2Phone: Optional[str] = None
+    guardian2Email: Optional[str] = None
     guardian2Address: Optional[str] = None
 
 
-def _profile_is_complete(user, profile) -> bool:
-    """Check if profile has all required fields for orientation booking."""
+def _profile_is_complete(user, profile, intake_confirmed: bool = False) -> bool:
+    """Check if profile has all required fields for orientation booking.
+
+    Preferred pharmacy is only required once the patient has a confirmed
+    clinical intake appointment; before that it isn't collected yet, so it
+    must not block "profile complete" (which gates orientation booking,
+    i.e. the step that happens before intake even exists)."""
     if not profile:
         return False
-    # Required: name (on user), sex, dob, ssn, phone, address, preferred pharmacy, parent 1
+    # Required: name (on user), sex, dob, ssn, phone, address, parent 1;
+    # preferred pharmacy only once intake_confirmed is True.
     first = (getattr(user, "firstName", None) or getattr(user, "first_name", "") or "").strip()
     last = (getattr(user, "lastName", None) or getattr(user, "last_name", "") or "").strip()
     phone = (getattr(user, "phone", None) or "").strip()
@@ -52,13 +81,16 @@ def _profile_is_complete(user, profile) -> bool:
     dob = getattr(profile, "dateOfBirth", None) or getattr(profile, "date_of_birth", None)
     ssn = (getattr(profile, "ssn", None) or "").strip()
     address = (getattr(profile, "address", None) or "").strip()
-    pharmacy = (getattr(profile, "preferredPharmacyName", None) or getattr(profile, "preferred_pharmacy_name", None) or "").strip()
-    pharmacy_address = (getattr(profile, "preferredPharmacyAddress", None) or getattr(profile, "preferred_pharmacy_address", None) or "").strip()
     g1_name = (getattr(profile, "guardian1Name", None) or getattr(profile, "guardian_1_name", None) or "").strip()
     g1_relationship = (getattr(profile, "guardian1Relationship", None) or getattr(profile, "guardian_1_relationship", None) or "").strip()
     g1_phone = (getattr(profile, "guardian1Phone", None) or getattr(profile, "guardian_1_phone", None) or "").strip()
     g1_address = (getattr(profile, "guardian1Address", None) or getattr(profile, "guardian_1_address", None) or "").strip()
-    return bool(first and last and phone and sex and dob and ssn and address and pharmacy and pharmacy_address and g1_name and g1_relationship and g1_phone and g1_address)
+    base_complete = bool(first and last and phone and sex and dob and ssn and address and g1_name and g1_relationship and g1_phone and g1_address)
+    if not intake_confirmed:
+        return base_complete
+    pharmacy = (getattr(profile, "preferredPharmacyName", None) or getattr(profile, "preferred_pharmacy_name", None) or "").strip()
+    pharmacy_address = (getattr(profile, "preferredPharmacyAddress", None) or getattr(profile, "preferred_pharmacy_address", None) or "").strip()
+    return base_complete and bool(pharmacy and pharmacy_address)
 
 
 @router.get("/")
@@ -72,10 +104,12 @@ async def get_my_profile(session: dict = Depends(require_patient)):
     if not user or user.role != "patient":
         raise HTTPException(status_code=404, detail="Patient not found")
     profile = getattr(user, "patientProfile", None)
+    intake_confirmed = await _has_confirmed_clinical_intake(db, session["id"])
     if not profile:
         return {
             "profile": None,
             "isComplete": False,
+            "intakeConfirmed": intake_confirmed,
             "lastUpdatedAt": (
                 getattr(user, "updatedAt", None) or getattr(user, "updated_at", None)
             ).isoformat()
@@ -90,7 +124,10 @@ async def get_my_profile(session: dict = Depends(require_patient)):
         }
     return {
         "profile": {
+            "preferredName": getattr(profile, "preferredName", None) or getattr(profile, "preferred_name", None),
             "sex": getattr(profile, "sex", None),
+            "race": getattr(profile, "race", None),
+            "preferredLanguage": getattr(profile, "preferredLanguage", None) or getattr(profile, "preferred_language", None),
             "dateOfBirth": (getattr(profile, "dateOfBirth", None) or getattr(profile, "date_of_birth")).isoformat()[:10] if getattr(profile, "dateOfBirth", None) or getattr(profile, "date_of_birth", None) else None,
             "ssn": getattr(profile, "ssn", None),
             "address": getattr(profile, "address", None),
@@ -100,14 +137,17 @@ async def get_my_profile(session: dict = Depends(require_patient)):
             "guardian1Name": getattr(profile, "guardian1Name", None) or getattr(profile, "guardian_1_name", None),
             "guardian1Relationship": getattr(profile, "guardian1Relationship", None) or getattr(profile, "guardian_1_relationship", None),
             "guardian1Phone": getattr(profile, "guardian1Phone", None) or getattr(profile, "guardian_1_phone", None),
+            "guardian1Email": getattr(profile, "guardian1Email", None) or getattr(profile, "guardian_1_email", None),
             "guardian1Address": getattr(profile, "guardian1Address", None) or getattr(profile, "guardian_1_address", None),
             "guardian2Name": getattr(profile, "guardian2Name", None) or getattr(profile, "guardian_2_name", None),
             "guardian2Relationship": getattr(profile, "guardian2Relationship", None) or getattr(profile, "guardian_2_relationship", None),
             "guardian2Phone": getattr(profile, "guardian2Phone", None) or getattr(profile, "guardian_2_phone", None),
+            "guardian2Email": getattr(profile, "guardian2Email", None) or getattr(profile, "guardian_2_email", None),
             "guardian2Address": getattr(profile, "guardian2Address", None) or getattr(profile, "guardian_2_address", None),
             "parentAddress": getattr(profile, "parentAddress", None) or getattr(profile, "parent_address", None),
         },
-        "isComplete": _profile_is_complete(user, profile),
+        "isComplete": _profile_is_complete(user, profile, intake_confirmed),
+        "intakeConfirmed": intake_confirmed,
         "lastUpdatedAt": (
             getattr(profile, "updatedAt", None) or getattr(profile, "updated_at", None)
         ).isoformat()
@@ -137,7 +177,8 @@ async def check_profile_complete(session: dict = Depends(require_patient)):
     if not user or user.role != "patient":
         return {"isComplete": False}
     profile = getattr(user, "patientProfile", None)
-    return {"isComplete": _profile_is_complete(user, profile)}
+    intake_confirmed = await _has_confirmed_clinical_intake(db, session["id"])
+    return {"isComplete": _profile_is_complete(user, profile, intake_confirmed), "intakeConfirmed": intake_confirmed}
 
 
 @router.put("/")
@@ -150,6 +191,16 @@ async def update_my_profile(body: PatientProfileUpdateBody, session: dict = Depe
     )
     if not user or user.role != "patient":
         raise HTTPException(status_code=404, detail="Patient not found")
+
+    pharmacy_fields_submitted = any(
+        v is not None
+        for v in (body.preferredPharmacyName, body.preferredPharmacyPhone, body.preferredPharmacyAddress)
+    )
+    if pharmacy_fields_submitted and not await _has_confirmed_clinical_intake(db, session["id"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Preferred pharmacy can only be set after your clinical intake appointment is confirmed.",
+        )
 
     # Update User fields if provided
     user_updates = {}
@@ -174,8 +225,14 @@ async def update_my_profile(body: PatientProfileUpdateBody, session: dict = Depe
     profile_data = {
         "userId": session["id"],
     }
+    if body.preferredName is not None:
+        profile_data["preferredName"] = body.preferredName.strip() if body.preferredName else None
     if body.sex is not None:
         profile_data["sex"] = body.sex.strip() if body.sex else None
+    if body.race is not None:
+        profile_data["race"] = body.race.strip() if body.race else None
+    if body.preferredLanguage is not None:
+        profile_data["preferredLanguage"] = body.preferredLanguage.strip() if body.preferredLanguage else None
     if body.dateOfBirth is not None:
         profile_data["dateOfBirth"] = f"{dob_dt.isoformat()}T00:00:00.000Z" if dob_dt else None
     if body.ssn is not None:
@@ -194,6 +251,8 @@ async def update_my_profile(body: PatientProfileUpdateBody, session: dict = Depe
         profile_data["guardian1Relationship"] = body.guardian1Relationship.strip() if body.guardian1Relationship else None
     if body.guardian1Phone is not None:
         profile_data["guardian1Phone"] = body.guardian1Phone.strip() if body.guardian1Phone else None
+    if body.guardian1Email is not None:
+        profile_data["guardian1Email"] = body.guardian1Email.strip() if body.guardian1Email else None
     if body.guardian1Address is not None:
         profile_data["guardian1Address"] = body.guardian1Address.strip() if body.guardian1Address else None
     if body.guardian2Name is not None:
@@ -202,6 +261,8 @@ async def update_my_profile(body: PatientProfileUpdateBody, session: dict = Depe
         profile_data["guardian2Relationship"] = body.guardian2Relationship.strip() if body.guardian2Relationship else None
     if body.guardian2Phone is not None:
         profile_data["guardian2Phone"] = body.guardian2Phone.strip() if body.guardian2Phone else None
+    if body.guardian2Email is not None:
+        profile_data["guardian2Email"] = body.guardian2Email.strip() if body.guardian2Email else None
     if body.guardian2Address is not None:
         profile_data["guardian2Address"] = body.guardian2Address.strip() if body.guardian2Address else None
 
@@ -217,7 +278,8 @@ async def update_my_profile(body: PatientProfileUpdateBody, session: dict = Depe
     # Re-fetch and check if complete; set completedAt if so
     user = await db.user.find_unique(where={"id": session["id"]}, include={"patientProfile": True})
     profile = getattr(user, "patientProfile", None)
-    if profile and _profile_is_complete(user, profile) and not getattr(profile, "completedAt", None):
+    intake_confirmed = await _has_confirmed_clinical_intake(db, session["id"])
+    if profile and _profile_is_complete(user, profile, intake_confirmed) and not getattr(profile, "completedAt", None):
         await db.patientprofile.update(
             where={"id": profile.id},
             data={"completedAt": datetime.now(timezone.utc)},
