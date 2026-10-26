@@ -3,6 +3,9 @@
 venv
 env
 
+# node dependencies (vendored, should not be committed)
+node_modules
+
 # env files (secrets - do not commit)
 .env
 .env*.local
